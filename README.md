@@ -13,9 +13,123 @@ This project is a python server that implements the [Model Context Protocol (MCP
 
 This MCP server provides the following tools:
 
+### Read Tools
+
 - `zotero_search_items`: Search for items in your Zotero library using a text query
 - `zotero_item_metadata`: Get detailed metadata information about a specific Zotero item
 - `zotero_item_fulltext`: Get the full text of a specific Zotero item (i.e. PDF contents)
+- `zotero_get_collections`: Retrieve collection tree with paths and item counts
+
+### Write Tools (Web API only)
+
+- `zotero_create_item`: Create a new item from a template, with optional tags/collections/parent
+- `zotero_update_item`: Update an existing item by key (patch by default; supports put)
+- `zotero_add_note`: Create a note (top-level or as a child of an item)
+- `zotero_set_tags`: Replace or append tags on an item
+
+### Export & Bibliography Tools
+
+- `zotero_export_collection`: Export items in a collection to formats like RIS, BibTeX, CSL JSON, CSV, or styled bibliography/citations
+- `zotero_export_bibliography`: Export library or collection bibliography to a file with SHA-256 hash verification
+- `zotero_ensure_style`: Download and cache CSL style files for citation formatting
+- `zotero_ensure_yaml_citations`: Update Markdown YAML front-matter with bibliography and CSL settings
+
+### Auto-Export Tools (Better BibTeX Integration)
+
+- `zotero_ensure_auto_export`: Configure automatic bibliography export (generic with fallback)
+- `zotero_bbt_ensure_auto_export_job`: Create/verify Better BibTeX auto-export jobs for hands-free sync
+- `zotero_bbt_resolve_citekeys`: Resolve citekeys using Better BibTeX local API
+
+### Citation & Authoring Tools
+
+- `zotero_resolve_citekeys`: Resolve citekeys from multiple sources (Better BibTeX, CSL JSON, or Zotero)
+- `zotero_insert_citation`: Generate formatted citation strings (Pandoc or LaTeX style)
+- `zotero_suggest_citations`: Get ranked citation suggestions based on text context
+
+### Validation & Build Tools
+
+- `zotero_validate_references`: Validate Markdown citekeys against bibliography, report issues
+- `zotero_build_exports`: Build DOCX/HTML/PDF outputs using Pandoc with citation processing
+
+### Convenience Tools
+
+- `zotero_open_in_zotero`: Generate zotero:// URLs to open items in the Zotero application
+
+### Write tools usage
+
+- `zotero_create_item(itemType, fields, tags?, collections?, parentItem?, validateOnly?, writeToken?)`
+  - Use `validateOnly=true` to check fields before writing.
+  - `writeToken` enables idempotent create; repeated requests with the same token are rejected by Zotero.
+
+- `zotero_update_item(itemKey, patch, strategy="patch"|"put", expectedVersion?)`
+  - `patch` (default) changes only provided fields and preserves others.
+  - `put` sends a full item: unspecified fields are removed — use with care.
+  - If `expectedVersion` is omitted, the tool fetches the current item to obtain its version.
+
+- `zotero_set_tags(itemKey, tags, mode="replace"|"append")`
+  - `replace` overwrites tags with the provided list.
+  - `append` keeps existing tags and adds the provided tags.
+
+Common errors are mapped to helpful hints where possible (400 invalid fields, 403 insufficient scope, 409 locked, 412 version mismatch, 429 rate limited).
+
+### Export and Bibliography Tools Usage
+
+- `zotero_export_collection(collectionKey, format, style?, limit?, start?, fetchAll?)`
+  - export formats: `ris`, `bibtex`, `csv`, `csljson`, `wikipedia`, and others supported by Zotero.
+  - bibliography/citation: set `format` to `bib` or `citation` and optionally provide `style` (e.g., `apa`).
+  - For export formats, the API requires a `limit` (max 100 per page). Use `fetchAll=true` to retrieve all items.
+
+- `zotero_export_bibliography(targetPath, format="csljson"|"bibtex"|"biblatex", scope="library"|"collection", collectionKey?)`
+  - Export to a file on disk with SHA-256 hash for change detection
+  - Returns `{path, count, sha256, warnings}`
+
+- `zotero_ensure_style(style, targetPath)`
+  - Download CSL style by ID or URL to specified path
+  - Idempotent: skips download if file exists
+
+- `zotero_ensure_yaml_citations(documentPath, bibliography?, csl?, linkCitations?)`
+  - Update Markdown YAML front-matter with citation settings
+  - Preserves other YAML fields
+
+### Auto-Export Usage (Better BibTeX)
+
+- `zotero_ensure_auto_export(path, format="csljson"|"bibtex"|"biblatex", scope="library"|"collection", collectionKey?, keepUpdated=true)`
+  - Configure automatic bibliography sync (requires Better BibTeX plugin)
+  - Falls back gracefully with guidance if Better BibTeX unavailable
+
+- `zotero_bbt_ensure_auto_export_job(path, format, scope, collectionKey?, keepUpdated=true)`
+  - Direct Better BibTeX auto-export job management
+  - Returns created/updated/verified status
+
+### Citation Authoring Usage
+
+- `zotero_resolve_citekeys(citekeys, bibliographyPath?, tryZotero=true, preferBBT=true)`
+  - Multi-source resolution: Better BibTeX → file → Zotero API
+  - Returns `{resolved: {...}, unresolved: [...], duplicateKeys: [...]}`
+
+- `zotero_insert_citation(citekeys, style="pandoc"|"latex", prefix?, suffix?, pages?)`
+  - Generate formatted citations: `[@key1; @key2, p. 42]` or `\parencite[42]{key1,key2}`
+
+- `zotero_suggest_citations(text, limit=5, qmode="titleCreatorYear"|"everything")`
+  - Get ranked suggestions with match rationale (title/author/DOI overlap)
+
+### Validation and Build Usage
+
+- `zotero_validate_references(documentPath, bibliographyPath, requireDOIURL=true)`
+  - Scan Markdown for citekeys and validate against bibliography
+  - Reports: unresolved keys, duplicates, missing fields, unused entries
+
+- `zotero_build_exports(documentPath, formats=["docx","html","pdf"], bibliographyPath?, cslPath?, useCiteproc=true, pdfEngine="edge"|"xelatex", extraArgs?)`
+  - Build outputs with Pandoc and citation processing
+  - Returns output paths and warnings
+
+### Convenience Tools Usage
+
+- `zotero_get_collections(parentKey?)`
+  - Retrieve collection tree with `{key, name, parentKey, path, itemCount}`
+
+- `zotero_open_in_zotero(itemKey, libraryType?, libraryId?)`
+  - Generate `zotero://select/library/items/<key>` URL
 
 These can be discovered and accessed through any MCP client or through the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector).
 
@@ -39,6 +153,9 @@ These are the available configuration options:
 - `ZOTERO_API_KEY`: Your Zotero API key (not required for the local API)
 - `ZOTERO_LIBRARY_ID`: Your Zotero library ID (your user ID for user libraries, not required for the local API)
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
+
+> [!NOTE]
+> Write operations require the Web API. If `ZOTERO_LOCAL=true` is set, write tools will return a helpful error and no changes will be made.
 
 ### [`uvx`](https://docs.astral.sh/uv/getting-started/installation/) with Local Zotero API
 
@@ -141,6 +258,34 @@ npx @modelcontextprotocol/inspector \
         --env ZOTERO_LIBRARY_ID \
         zotero-mcp:local
 ```
+
+### Run as an HTTP SSE server (Docker)
+
+If you want to expose this server on your LAN as an SSE endpoint consumable by MCP clients, use the helper script:
+
+1. Create a `.env.local` in the repo root with your Web API credentials:
+
+  ```env
+  ZOTERO_API_KEY=your_api_key
+  ZOTERO_LIBRARY_ID=your_library_id
+  # Optional (defaults to "user")
+  ZOTERO_LIBRARY_TYPE=user
+  ```
+
+2. (Optional) Set bind host/port. Defaults are `0.0.0.0:9180`.
+
+  ```bash
+  export MCP_HOST=0.0.0.0
+  export MCP_PORT=9180
+  ```
+
+3. Start the containerized SSE server:
+
+  ```bash
+  ./scripts/run-docker.sh
+  ```
+
+The server will listen at `http://<your-host>:<MCP_PORT>/sse` (e.g., `http://192.168.1.114:9180/sse`). Point your MCP client to that URL.
 
 ## Relevant Documentation
 

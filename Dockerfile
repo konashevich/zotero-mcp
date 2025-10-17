@@ -18,5 +18,8 @@ LABEL org.opencontainers.image.url="https://github.com/zotero/zotero-mcp"
 LABEL org.opencontainers.image.source="https://github.com/zotero/zotero-mcp"
 LABEL org.opencontainers.image.license="MIT"
 
+# Expose default SSE port (configurable at runtime)
+EXPOSE 9180
+
 # Command to run the server
 ENTRYPOINT ["uv", "run", "--quiet", "zotero-mcp"]

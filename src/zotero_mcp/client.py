@@ -7,7 +7,10 @@ from pyzotero import zotero
 
 
 # Load environment variables
+# Load standard .env if present (from CWD or nearest)
 load_dotenv()
+# Load .env.local if present in CWD, allowing overrides for local development
+load_dotenv(".env.local", override=True)
 
 
 # Initialize Zotero client
