@@ -153,6 +153,15 @@ These are the available configuration options:
 - `ZOTERO_API_KEY`: Your Zotero API key (not required for the local API)
 - `ZOTERO_LIBRARY_ID`: Your Zotero library ID (your user ID for user libraries, not required for the local API)
 - `ZOTERO_LIBRARY_TYPE`: The type of library (user or group, default: user)
+- `ZOTERO_REQUEST_TIMEOUT`: HTTP request timeout (seconds) for the Zotero client; defaults to 6.0
+- `ZOTERO_CACHE_TTL`: In-memory cache TTL (seconds) for recent calls; defaults to 30
+- `ZOTERO_CACHE_MAX`: Max in-memory cache entries before evicting oldest; defaults to 200
+- `ZOTERO_RATE_MIN_INTERVAL`: Minimum seconds between repeated calls in the same bucket; defaults to 0.2
+- `ZOTERO_DEFAULT_CSL`: Default CSL path or style id to use when none provided; defaults to `lncs.csl` (downloaded as Springer LNCS)
+- `ZOTERO_DEFAULT_EXPORT_PATH`: Default auto-export path when not specified; defaults to `references.bib` at repo root
+- `ZOTERO_DEFAULT_EXPORT_FORMAT`: Default auto-export format when not specified; defaults to `bibtex`
+- `ZOTERO_SUGGEST_LOCAL_FIRST`: If true, suggestion tool ranks from recently cached search results first; defaults to `true`
+- `LOG_LEVEL`: Python logging level for server (DEBUG, INFO, WARNING, ERROR); defaults to `INFO`
 
 > [!NOTE]
 > Write operations require the Web API. If `ZOTERO_LOCAL=true` is set, write tools will return a helpful error and no changes will be made.
@@ -208,8 +217,8 @@ To update to a newer version, run `docker pull ghcr.io/kujenga/zotero-mcp:main`.
 Information on making changes and contributing to the project.
 
 1. Clone this repository
-1. Install dependencies with [uv](https://docs.astral.sh/uv/) by running: `uv sync`
-1. Create a `.env` file in the project root with the environment variables above
+1. Install dependencies with [uv](https://docs.astral.sh/uv/) by running: `uv sync` (includes PyYAML; if using a system Python without uv, ensure `pip install PyYAML` is installed on the host)
+1. Create a `.env` (or `.env.local`) file in the project root with the environment variables above. See `.env.example` for a quick start.
 
 Start the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector) for local development:
 

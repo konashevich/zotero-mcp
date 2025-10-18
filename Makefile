@@ -1,6 +1,6 @@
 # Utilities for managing zotero-mcp
 
-.PHONY: run run-local test lint format inspector publish-test publish
+.PHONY: run run-local test lint format inspector publish-test publish docker-build docker-run health build-docs build-pdf
 
 run:
 	uv run zotero-mcp
@@ -38,3 +38,21 @@ publish-test:
 	uvx twine upload \
 		--repository=testpypi \
 		--password="$$(op read "op://Private/Test PyPi/API/token")" dist/*
+
+# Docker helpers
+docker-build:
+	docker build -t zotero-mcp:local .
+
+docker-run:
+	bash scripts/run-docker.sh -d
+
+# Quick health check via MCP tool (requires server running locally)
+health:
+	@echo "Use the inspector to call zotero_health, or query your MCP client."
+
+# Build docs via helper script
+build-docs:
+	@echo "Example: uv run python scripts/build_exports.py -d paper.md -f docx,pdf -b refs.json -c .styles/lncs.csl"
+
+build-pdf:
+	uv run python scripts/build_exports.py -d paper.md -f pdf -b refs.json -c .styles/lncs.csl --pdf-engine edge

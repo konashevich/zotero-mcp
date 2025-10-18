@@ -29,12 +29,23 @@ def get_zotero_client() -> zotero.Zotero:
             "Missing required environment variables. Please set ZOTERO_LIBRARY_ID and ZOTERO_API_KEY"
         )
 
-    return zotero.Zotero(
+    client = zotero.Zotero(
         library_id=library_id,
         library_type=library_type,
         api_key=api_key,
         local=local,
     )
+
+    # Best-effort: configure request timeout if pyzotero honors `timeout`
+    # Many versions read `self.timeout` when issuing HTTP calls.
+    try:
+        timeout = float(os.getenv("ZOTERO_REQUEST_TIMEOUT", "6.0"))
+        if timeout > 0:
+            setattr(client, "timeout", timeout)
+    except Exception:
+        pass
+
+    return client
 
 
 class AttachmentDetails(BaseModel):

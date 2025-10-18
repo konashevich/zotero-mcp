@@ -1,4 +1,5 @@
 import os
+import typing as _typing
 import shutil
 import urllib
 import subprocess
@@ -18,15 +19,28 @@ except Exception:  # noqa: BLE001
 logger = logging.getLogger("zotero_mcp")
 if not logger.handlers:
     h = logging.StreamHandler()
-    formatter = logging.Formatter("[%(levelname)s] %(message)s")
+    # Include timestamp and tool name for easier tracing
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] zotero_mcp: %(message)s", "%Y-%m-%dT%H:%M:%SZ")
     h.setFormatter(formatter)
     logger.addHandler(h)
-    logger.setLevel(logging.INFO)
+    # Allow LOG_LEVEL env to control verbosity; default INFO
+    _lvl = os.getenv("LOG_LEVEL", "INFO").upper()
+    try:
+        logger.setLevel(getattr(logging, _lvl, logging.INFO))
+    except Exception:  # noqa: BLE001
+        logger.setLevel(logging.INFO)
+    # Ensure UTC timestamps
+    for handler in logger.handlers:
+        try:
+            handler.formatter.converter = time.gmtime  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 # Simple in-memory TTL cache and rate limiter
 _CACHE: dict[str, tuple[float, Any]] = {}
 _CACHE_TTL_DEFAULT = 30.0
 _RL_LAST: dict[str, float] = {}
+_CACHE_MAX_ENTRIES_DEFAULT = 200
 
 
 def _cache_ttl() -> float:
@@ -50,6 +64,17 @@ def _cache_get(key: str) -> Any | None:
 
 def _cache_set(key: str, value: Any) -> None:
     _CACHE[key] = (time.monotonic(), value)
+    # Evict oldest entries if cache grows too large
+    try:
+        max_entries = int(os.getenv("ZOTERO_CACHE_MAX", str(_CACHE_MAX_ENTRIES_DEFAULT)))
+    except Exception:
+        max_entries = _CACHE_MAX_ENTRIES_DEFAULT
+    if max_entries > 0 and len(_CACHE) > max_entries:
+        # drop oldest ~10% to keep simple
+        n_drop = max(1, max_entries // 10)
+        oldest = sorted(_CACHE.items(), key=lambda kv: kv[1][0])[:n_drop]
+        for k, _ in oldest:
+            _CACHE.pop(k, None)
 
 
 def _rate_min_interval() -> float:
@@ -102,6 +127,42 @@ from zotero_mcp.client import get_attachment_details, get_zotero_client
 
 # Create an MCP server
 mcp = FastMCP("Zotero")
+@mcp.tool(
+    name="zotero_health",
+    description=(
+        "Report server health: yaml import availability, Zotero client init, and key config values."
+    ),
+)
+def zotero_health() -> str:
+    """Return a compact health summary for quick diagnostics."""
+    import importlib
+    import os as _os
+    import json as _json
+    _t0 = time.perf_counter()
+    info: dict[str, Any] = {}
+    # yaml availability
+    try:
+        _ = importlib.import_module("yaml")
+        info["yaml"] = "ok"
+    except Exception:
+        info["yaml"] = "missing"
+    # Zotero client init
+    try:
+        _ = get_zotero_client()
+        info["zoteroClient"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        info["zoteroClient"] = f"error: {e}"
+    # key configs
+    info["timeout"] = _os.getenv("ZOTERO_REQUEST_TIMEOUT", "(default)")
+    info["cacheTTL"] = _os.getenv("ZOTERO_CACHE_TTL", "(default)")
+    info["cacheMax"] = _os.getenv("ZOTERO_CACHE_MAX", "(default)")
+    info["rateMinInterval"] = _os.getenv("ZOTERO_RATE_MIN_INTERVAL", "(default)")
+    info["logLevel"] = logging.getLevelName(logger.level)
+    info["now"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    info["latencyMs"] = round((time.perf_counter() - _t0) * 1000, 1)
+    # output compact JSON for machine-readability
+    logger.debug(f"health: {info}")
+    return "# Health\n" + _compact_json_block("result", info)
 
 
 def format_item(item: dict[str, Any]) -> str:
@@ -938,8 +999,12 @@ def ensure_yaml_citations(
     import os as _os
     import re
     import tempfile
-    import yaml
+    try:
+        import yaml  # type: ignore
+    except Exception:  # noqa: BLE001
+        yaml = None  # type: ignore
 
+    _t0 = time.perf_counter()
     try:
         with open(documentPath, "r", encoding="utf-8") as f:
             content = f.read()
@@ -953,23 +1018,57 @@ def ensure_yaml_citations(
             fm_text = ""
             body = content
 
-        # Parse YAML front matter using safe loader; treat missing or invalid as empty mapping
-        try:
-            fm_obj = yaml.safe_load(fm_text) if fm_text.strip() else {}
-            if not isinstance(fm_obj, dict):
+        if yaml is not None:
+            # Parse YAML front matter using safe loader; treat missing or invalid as empty mapping
+            try:
+                fm_obj = yaml.safe_load(fm_text) if fm_text.strip() else {}
+                if not isinstance(fm_obj, dict):
+                    fm_obj = {}
+            except Exception:
                 fm_obj = {}
-        except Exception:
-            fm_obj = {}
 
-        # Update required keys
-        fm_obj["bibliography"] = bibliographyPath
-        fm_obj["csl"] = cslPath
-        if linkCitations is not None:
-            fm_obj["link-citations"] = bool(linkCitations)
+            # Update required keys
+            fm_obj["bibliography"] = bibliographyPath
+            fm_obj["csl"] = cslPath
+            if linkCitations is not None:
+                fm_obj["link-citations"] = bool(linkCitations)
 
-        # Dump YAML preserving key order without sorting
-        dumped = yaml.safe_dump(fm_obj, sort_keys=False).strip()
-        new_content = f"---\n{dumped}\n---\n{body if body else ''}"
+            # Dump YAML preserving key order without sorting
+            dumped = yaml.safe_dump(fm_obj, sort_keys=False).strip()
+            new_content = f"---\n{dumped}\n---\n{body if body else ''}"
+        else:
+            # Fallback path: text-only updater (idempotent best-effort)
+            # Build a minimal YAML block with required keys
+            lc_val = "true" if (linkCitations is None or linkCitations) else "false"
+            required = [
+                f"bibliography: {bibliographyPath}",
+                f"csl: {cslPath}",
+                f"link-citations: {lc_val}",
+            ]
+            # If front matter exists, replace or insert keys; otherwise, create new front matter
+            if fm_text:
+                lines = [ln for ln in fm_text.split("\n") if ln.strip() != ""]
+                def upsert(lines: list[str], k: str, v: str) -> list[str]:
+                    key = k.split(":", 1)[0]
+                    found = False
+                    out: list[str] = []
+                    for ln in lines:
+                        if ln.strip().startswith(f"{key}:") and not found:
+                            out.append(k)
+                            found = True
+                        else:
+                            out.append(ln)
+                    if not found:
+                        out.append(k)
+                    return out
+                cur = lines
+                for entry in required:
+                    cur = upsert(cur, entry, entry)
+                dumped = "\n".join(cur)
+                new_content = f"---\n{dumped}\n---\n{body if body else ''}"
+            else:
+                dumped = "\n".join(required)
+                new_content = f"---\n{dumped}\n---\n{body if body else ''}"
 
         # Atomic write back
         target_dir = _os.path.dirname(documentPath) or "."
@@ -979,8 +1078,11 @@ def ensure_yaml_citations(
             tmp_path = tmp.name
         _os.replace(tmp_path, documentPath)
 
+        _ms = round((time.perf_counter() - _t0) * 1000, 1)
+        logger.info(f"ensure_yaml_citations: updated {documentPath} in {_ms} ms")
         return "YAML citations updated."
     except Exception as e:  # noqa: BLE001
+        logger.exception("ensure_yaml_citations: error")
         return _format_error("Error ensuring YAML citations", e)
 
 
@@ -1019,6 +1121,14 @@ def ensure_auto_export(
         with urllib.request.urlopen(req, timeout=1.5) as resp:  # nosec - local endpoint by design
             return resp.read()
 
+    # Apply sensible defaults when inputs are placeholders
+    if not path or path.strip() in {".", "./", "auto"}:
+        path = os.getenv("ZOTERO_DEFAULT_EXPORT_PATH", os.path.abspath("references.bib"))
+    if not format:
+        fmt_env = os.getenv("ZOTERO_DEFAULT_EXPORT_FORMAT", "bibtex") or "bibtex"
+        if fmt_env not in {"bibtex", "biblatex", "csljson"}:
+            fmt_env = "bibtex"
+        format = _typing.cast(Literal["bibtex", "biblatex", "csljson"], fmt_env)
     spec = {"path": path, "format": format, "scope": scope, "collectionKey": collectionKey}
 
     try:
@@ -1520,15 +1630,74 @@ def suggest_citations(
     limit: int | None = 5,
     qmode: Literal["titleCreatorYear", "everything"] | None = "titleCreatorYear",
 ) -> str:
-    """Suggest citation items with basic token overlap scoring against titles and creators."""
+    """Suggest citation items with basic token overlap scoring against titles and creators.
+
+    Adds: small cache, retry with narrower query on timeout, and short backoff.
+    """
+    _t0 = time.perf_counter()
     if not text or len(text.strip()) < 3:
         return "Input text too short to suggest citations."
     zot = get_zotero_client()
 
-    # Fetch candidates
-    zot.add_parameters(q=text, qmode=qmode, limit=limit or 5)
-    results: Any = zot.items()
+    cache_key = f"suggest:{qmode}:{limit}:{text.strip().lower()[:200]}"
+
+    # Optional local-first: scan recent cached search results and rank locally
+    local_first = os.getenv("ZOTERO_SUGGEST_LOCAL_FIRST", "true").lower() in {"1", "true", "yes"}
+    # threshold for score to accept local results without server call
+    try:
+        local_threshold = int(os.getenv("ZOTERO_SUGGEST_LOCAL_THRESHOLD", "2"))
+    except Exception:
+        local_threshold = 2
+    local_candidates: list[dict[str, Any]] = []
+    if local_first:
+        try:
+            for k, (_, val) in list(_CACHE.items()):  # type: ignore[misc]
+                if isinstance(k, str) and k.startswith("search:") and isinstance(val, list):
+                    for it in val:
+                        if isinstance(it, dict):
+                            local_candidates.append(it)
+        except Exception:
+            local_candidates = []
+
+    results: Any = None
+    used_server = False
+    if local_candidates:
+        # We'll rank locally; only call server if we don't meet threshold later
+        results = local_candidates
+    else:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            results = cached
+        else:
+            # Fetch candidates with minimal retry policy
+            results = []
+            tries = 0
+            max_retries = 2
+            while tries <= max_retries:
+                tries += 1
+                try:
+                    zot.add_parameters(q=text, qmode=qmode, limit=limit or 5)
+                    _rate_limit("zot.suggest")
+                    results = zot.items()
+                    used_server = True
+                    break
+                except Exception:
+                    # On first failure for broad queries, retry with titleCreatorYear
+                    if tries == 1 and qmode != "titleCreatorYear":
+                        logger.warning("suggest_citations: retry with titleCreatorYear after failure")
+                        qmode = "titleCreatorYear"
+                        continue
+                    import random as _rnd
+                    delay = 0.15 * tries + _rnd.random() * 0.1
+                    logger.warning(f"suggest_citations: backoff {delay:.2f}s (attempt {tries})")
+                    time.sleep(delay)
+            _cache_set(cache_key, results)
     if not results:
+        logger.info("suggest_citations: no results")
+        return "No suggestions found."
+
+    if not isinstance(results, list):
+        logger.info("suggest_citations: non-list results")
         return "No suggestions found."
 
     # Tokenize query
@@ -1538,6 +1707,8 @@ def suggest_citations(
 
     ranked: list[tuple[int, dict[str, Any], list[str], list[str], bool]] = []
     for it in results:
+        if not isinstance(it, dict):
+            continue
         data = it.get("data", {})
         title = data.get("title", "")
         creators = data.get("creators", []) or []
@@ -1560,6 +1731,42 @@ def suggest_citations(
 
     ranked.sort(key=lambda x: (-x[0], x[1].get("key", "")))
     top = ranked[: (limit or 5)]
+
+    # If we only used local candidates and the best score is below threshold, try a single server fetch
+    if local_first and local_candidates and top and top[0][0] < local_threshold:
+        try:
+            zot.add_parameters(q=text, qmode=qmode, limit=limit or 5)
+            _rate_limit("zot.suggest")
+            sres = zot.items()
+            used_server = True
+            if isinstance(sres, list) and sres:
+                results = sres
+                ranked = []
+                for it in results:
+                    if not isinstance(it, dict):
+                        continue
+                    data = it.get("data", {})
+                    title = data.get("title", "")
+                    creators = data.get("creators", []) or []
+                    tokens = set([t.lower() for t in _re.findall(r"[\w-]+", title)])
+                    matched_title = qtokens & tokens
+                    doi = data.get("DOI") or data.get("doi")
+                    doi_match = 1 if doi and any(part in (doi or "").lower() for part in qtokens) else 0
+                    for c in creators:
+                        if isinstance(c, dict):
+                            if "lastName" in c:
+                                tokens.add(c["lastName"].lower())
+                            if "firstName" in c:
+                                tokens.add(c["firstName"].lower())
+                            if "name" in c:
+                                tokens.add(c["name"].lower())
+                    matched_creators = qtokens & tokens
+                    score = (2 * len(matched_title)) + len(matched_creators) + doi_match
+                    ranked.append((score, it, sorted(list(matched_title))[:3], sorted(list(matched_creators))[:3], bool(doi)))
+                ranked.sort(key=lambda x: (-x[0], x[1].get("key", "")))
+                top = ranked[: (limit or 5)]
+        except Exception:
+            pass
 
     lines = [f"# Suggestions (top {len(top)})"]
     for i, pack in enumerate(top, start=1):
@@ -1585,6 +1792,8 @@ def suggest_citations(
             + (f" [match: {'; '.join(rationale)}]" if rationale else "")
         )
 
+    _ms = round((time.perf_counter() - _t0) * 1000, 1)
+    logger.info(f"suggest_citations: returned {len(top)} items in {_ms} ms; server={used_server}")
     return "\n".join(lines)
 
 
@@ -1749,6 +1958,7 @@ def build_exports(
     import subprocess
     from pathlib import Path as _Path
 
+    _t0 = time.perf_counter()
     out_paths: list[str] = []
     warnings: list[str] = []
     base = _Path(documentPath)
@@ -1757,6 +1967,31 @@ def build_exports(
     pandoc = shutil.which("pandoc")
     if not pandoc:
         return "Pandoc is not installed or not in PATH."
+
+    # Sensible defaults: if no CSL provided, try default from env or fetch LNCS
+    if not cslPath:
+        csl_default = os.getenv("ZOTERO_DEFAULT_CSL", "lncs.csl")
+        # if path-like provided in env and exists
+        if os.path.sep in csl_default and os.path.exists(csl_default):
+            cslPath = csl_default
+        else:
+            # keep styles in .styles/
+            styles_dir = os.path.abspath(".styles")
+            os.makedirs(styles_dir, exist_ok=True)
+            local_csl = os.path.join(styles_dir, csl_default)
+            # If file missing, try to download from CSL repo (LNCS or given id)
+            if not os.path.exists(local_csl):
+                try:
+                    style_id = (
+                        "springer-lecture-notes-in-computer-science"
+                        if csl_default.lower().startswith("lncs") or csl_default.lower().startswith("springer")
+                        else csl_default.replace(".csl", "")
+                    )
+                    _ = ensure_style(style_id, local_csl)
+                except Exception:
+                    pass
+            if os.path.exists(local_csl):
+                cslPath = local_csl
 
     for fmt in formats:
         out = str(base.with_suffix("." + ("pdf" if fmt == "pdf" else fmt)))
@@ -1796,6 +2031,8 @@ def build_exports(
         f"Outputs: {len(out_paths)}",
         (f"Warnings: {len(warnings)}" if warnings else ""),
     ]
+    _ms = round((time.perf_counter() - _t0) * 1000, 1)
+    logger.info(f"build_exports: built {len(out_paths)} outputs in {_ms} ms; warnings={len(warnings)}")
     return "\n".join([h for h in header if h]) + _compact_json_block(
         "result", {"outputs": out_paths, "warnings": warnings}
     )
