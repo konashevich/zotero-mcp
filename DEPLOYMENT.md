@@ -1,5 +1,62 @@
 # Docker Deployment - October 17, 2025
 
+## Quick local redeploy (this device)
+
+Use these steps to rebuild the Docker image and replace the running container on port 9180.
+
+1. Ensure local env is present
+
+- Create/update `.env.local` in the repo root with at least:
+  - `ZOTERO_API_KEY`
+  - `ZOTERO_LIBRARY_ID`
+  - `ZOTERO_LIBRARY_TYPE` (defaults to `user` if omitted)
+
+2. Build a new image
+
+```bash
+docker build -t zotero-mcp:local .
+```
+
+3. Stop the existing container on 9180 (if any)
+
+Option A — by name (script default name):
+
+```bash
+docker rm -f zotero-mcp-sse
+```
+
+Option B — whichever container is bound to 9180:
+
+```bash
+docker rm -f $(docker ps -a --format '{{.ID}} {{.Ports}}' | awk '/0.0.0.0:9180->8000/ {print $1}')
+```
+
+4. Launch the updated container (detached, port 9180)
+
+```bash
+bash scripts/run-docker.sh -d
+```
+
+This runs the server as `zotero-mcp-sse` and maps host 9180 to container 8000.
+
+5. Verify the new container is active
+
+```bash
+docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Ports}}' | grep 9180
+```
+
+Optional checks:
+
+```bash
+# View logs and confirm startup health line
+docker logs --tail 50 zotero-mcp-sse
+
+# Quick SSE endpoint probe
+timeout 3 curl -N http://localhost:9180/sse | head -5
+```
+
+If you see a line like `startup health:` in logs and `event: endpoint` from the SSE probe, the server is healthy.
+
 ## ✅ Deployment Complete
 
 ### New Docker Image
