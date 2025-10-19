@@ -140,12 +140,29 @@ def zotero_health() -> str:
     import json as _json
     _t0 = time.perf_counter()
     info: dict[str, Any] = {}
-    # yaml availability
+    
+    # Check PyYAML availability
     try:
         _ = importlib.import_module("yaml")
-        info["yaml"] = "ok"
+        info["pyyaml"] = "ok"
     except Exception:
-        info["yaml"] = "missing"
+        info["pyyaml"] = "missing"
+    
+    # Check ruamel.yaml availability
+    try:
+        _ = importlib.import_module("ruamel.yaml")
+        info["ruamel"] = "ok"
+    except Exception:
+        info["ruamel"] = "missing"
+    
+    # Predict which parser ensure_yaml_citations will use
+    if info["pyyaml"] == "ok":
+        info["yamlParser"] = "pyyaml"
+    elif info["ruamel"] == "ok":
+        info["yamlParser"] = "ruamel"
+    else:
+        info["yamlParser"] = "text"
+    
     # Zotero client init
     try:
         _ = get_zotero_client()
@@ -993,23 +1010,42 @@ def ensure_yaml_citations(
 ) -> str:
     """Insert or update YAML front matter keys for citations.
 
-    Minimal YAML handling without external dependencies. Preserves other YAML keys and original order where possible.
+    Tries multiple YAML parsers in order: PyYAML → ruamel.yaml → text fallback.
+    Preserves other YAML keys and original order where possible.
     """
-    import io
     import os as _os
     import re
     import tempfile
+    
+    # Try to detect available YAML parsers
+    yaml_parser = None
+    parser_name = "text"
+    
+    # Try PyYAML first
     try:
         import yaml  # type: ignore
+        yaml_parser = yaml
+        parser_name = "pyyaml"
     except Exception:  # noqa: BLE001
-        yaml = None  # type: ignore
+        # Try ruamel.yaml as fallback
+        try:
+            from ruamel.yaml import YAML as RuamelYAML  # type: ignore
+            yaml_parser = RuamelYAML()
+            parser_name = "ruamel"
+        except Exception:  # noqa: BLE001
+            yaml_parser = None
+            parser_name = "text"
 
     _t0 = time.perf_counter()
     try:
-        with open(documentPath, "r", encoding="utf-8") as f:
+        # Handle BOM and normalize newlines
+        with open(documentPath, "r", encoding="utf-8-sig") as f:
             content = f.read()
+        
+        # Normalize line endings to \n
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
 
-        # Detect front matter
+        # Detect front matter (anchored to start of file)
         fm_match = re.match(r"^---\n(.*?)\n---\n(.*)$", content, flags=re.DOTALL)
         if fm_match:
             fm_text = fm_match.group(1)
@@ -1018,10 +1054,10 @@ def ensure_yaml_citations(
             fm_text = ""
             body = content
 
-        if yaml is not None:
-            # Parse YAML front matter using safe loader; treat missing or invalid as empty mapping
+        if yaml_parser is not None and parser_name == "pyyaml":
+            # PyYAML path
             try:
-                fm_obj = yaml.safe_load(fm_text) if fm_text.strip() else {}
+                fm_obj = yaml_parser.safe_load(fm_text) if fm_text.strip() else {}
                 if not isinstance(fm_obj, dict):
                     fm_obj = {}
             except Exception:
@@ -1034,11 +1070,34 @@ def ensure_yaml_citations(
                 fm_obj["link-citations"] = bool(linkCitations)
 
             # Dump YAML preserving key order without sorting
-            dumped = yaml.safe_dump(fm_obj, sort_keys=False).strip()
+            dumped = yaml_parser.safe_dump(fm_obj, sort_keys=False).strip()
             new_content = f"---\n{dumped}\n---\n{body if body else ''}"
+            
+        elif yaml_parser is not None and parser_name == "ruamel":
+            # ruamel.yaml path
+            import io
+            try:
+                stream = io.StringIO(fm_text) if fm_text.strip() else io.StringIO("")
+                fm_obj = yaml_parser.load(stream)
+                if not isinstance(fm_obj, dict):
+                    fm_obj = {}
+            except Exception:
+                fm_obj = {}
+
+            # Update required keys
+            fm_obj["bibliography"] = bibliographyPath
+            fm_obj["csl"] = cslPath
+            if linkCitations is not None:
+                fm_obj["link-citations"] = bool(linkCitations)
+
+            # Dump YAML
+            output = io.StringIO()
+            yaml_parser.dump(fm_obj, output)
+            dumped = output.getvalue().strip()
+            new_content = f"---\n{dumped}\n---\n{body if body else ''}"
+            
         else:
-            # Fallback path: text-only updater (idempotent best-effort)
-            # Build a minimal YAML block with required keys
+            # Text fallback path: idempotent best-effort updater
             lc_val = "true" if (linkCitations is None or linkCitations) else "false"
             required = [
                 f"bibliography: {bibliographyPath}",
@@ -1079,8 +1138,8 @@ def ensure_yaml_citations(
         _os.replace(tmp_path, documentPath)
 
         _ms = round((time.perf_counter() - _t0) * 1000, 1)
-        logger.info(f"ensure_yaml_citations: updated {documentPath} in {_ms} ms")
-        return "YAML citations updated."
+        logger.info(f"ensure_yaml_citations: updated {documentPath} using {parser_name} parser in {_ms} ms")
+        return f"YAML citations updated (parser={parser_name})."
     except Exception as e:  # noqa: BLE001
         logger.exception("ensure_yaml_citations: error")
         return _format_error("Error ensuring YAML citations", e)

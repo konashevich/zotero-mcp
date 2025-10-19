@@ -90,6 +90,63 @@ Common errors are mapped to helpful hints where possible (400 invalid fields, 40
 - `zotero_ensure_yaml_citations(documentPath, bibliography?, csl?, linkCitations?)`
   - Update Markdown YAML front-matter with citation settings
   - Preserves other YAML fields
+  - Works with PyYAML, ruamel.yaml, or a text-based fallback
+  - Returns which parser was used: `(parser=pyyaml|ruamel|text)`
+
+### YAML Front Matter for Citations
+
+When working with Markdown documents that use Pandoc for citation processing, you need a YAML front matter block at the start of your document. The `zotero_ensure_yaml_citations` tool automatically adds or updates this block.
+
+**Minimal YAML front matter example:**
+
+```yaml
+---
+bibliography: references.json
+csl: style.csl
+link-citations: true
+---
+```
+
+**How it works:**
+
+- The tool tries to use PyYAML first, then ruamel.yaml, then falls back to text-based parsing
+- It preserves existing YAML keys and updates only citation-related fields
+- Works with documents that have BOM or Windows CRLF line endings
+- Running it multiple times is idempotent (produces the same result)
+
+**Manual fallback:**
+If you prefer to add the front matter manually, just paste the YAML block above at the very start of your Markdown file, adjusting the paths to match your bibliography and CSL style files.
+
+## Troubleshooting
+
+### YAML Parser Status
+
+You can check which YAML parser will be used by calling the `zotero_health` tool. It will report:
+
+- `pyyaml: ok|missing` - PyYAML availability
+- `ruamel: ok|missing` - ruamel.yaml availability  
+- `yamlParser: pyyaml|ruamel|text` - Which parser `ensure_yaml_citations` will use
+
+**If you see `yamlParser: text`:**
+The tool will still work using a text-based fallback, but for best results:
+- For Docker deployments: rebuild and redeploy using `make docker-redeploy` (see deployment instructions below)
+- For local installations: ensure PyYAML is installed (`pip install PyYAML` or `uv sync`)
+
+### Docker Redeploy
+
+To rebuild and redeploy the Docker container with the latest changes:
+
+```bash
+make docker-redeploy
+```
+
+This will:
+1. Build a new `zotero-mcp:local` image
+2. Stop and remove the old container
+3. Start a new container with the updated image
+4. Show recent logs to verify startup
+
+For manual steps, see `.github/instructions/deploy.instructions.md`.
 
 ### Auto-Export Usage (Better BibTeX)
 

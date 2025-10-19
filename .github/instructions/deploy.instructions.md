@@ -5,7 +5,19 @@ Provide project context and coding guidelines that AI should follow when generat
 
 ## Local Docker redeploy (this device)
 
-When asked to rebuild the Docker image and replace the running Zotero MCP server locally, follow these steps exactly:
+When asked to rebuild the Docker image and replace the running Zotero MCP server locally, you can use the automated command or follow the manual steps below.
+
+### Quick Method (Recommended)
+
+```bash
+make docker-redeploy
+```
+
+This automates all steps below: builds the image, stops the old container, starts the new one, and shows verification output.
+
+### Manual Steps
+
+If you need to troubleshoot or prefer manual control, follow these steps exactly:
 
 1. Ensure environment file exists
 	- Create or update a `.env.local` in the repo root with:
@@ -34,19 +46,29 @@ When asked to rebuild the Docker image and replace the running Zotero MCP server
 	```
 	- This starts the container as `zotero-mcp-sse` and maps host 9180 to container 8000.
 
-5. Verify it’s running the new image
+5. Verify it's running the new image
 	```bash
 	docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Ports}}' | grep 9180
 	```
-	Optional:
+	
+6. Check startup health and YAML parser availability
 	```bash
-	# Recent logs (look for a startup health line)
+	# Recent logs (look for startup health JSON with pyyaml/ruamel/yamlParser fields)
 	docker logs --tail 50 zotero-mcp-sse
-
-	# Quick SSE probe
+	```
+	
+	The health output should include:
+	- `pyyaml: ok` - PyYAML is available
+	- `ruamel: ok` - ruamel.yaml is available  
+	- `yamlParser: pyyaml` - Indicates which parser ensure_yaml_citations will use
+	
+	Optional SSE probe:
+	```bash
+	# Quick SSE endpoint check
 	timeout 3 curl -N http://localhost:9180/sse | head -5
 	```
 
 Notes
 - The Dockerfile performs a lightweight YAML library check during build; failures should be addressed by ensuring dependencies are installed via `uv sync` in the image.
 - Use `LOG_LEVEL=DEBUG` in `.env.local` if you want verbose startup/timing logs.
+- After redeployment, the `zotero_health` MCP tool will report enhanced diagnostics including YAML parser availability and selection.

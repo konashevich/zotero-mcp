@@ -1,6 +1,6 @@
 # Utilities for managing zotero-mcp
 
-.PHONY: run run-local test lint format inspector publish-test publish docker-build docker-run health build-docs build-pdf
+.PHONY: run run-local test lint format inspector publish-test publish docker-build docker-run docker-redeploy health build-docs build-pdf
 
 run:
 	uv run zotero-mcp
@@ -45,6 +45,20 @@ docker-build:
 
 docker-run:
 	bash scripts/run-docker.sh -d
+
+# Full redeploy: build image, stop old container, start new one
+docker-redeploy:
+	@echo "==> Building Docker image..."
+	docker build -t zotero-mcp:local .
+	@echo "==> Stopping and removing old container..."
+	-docker rm -f zotero-mcp-sse 2>/dev/null || true
+	@echo "==> Starting new container..."
+	bash scripts/run-docker.sh -d
+	@echo "==> Verifying container is running..."
+	@sleep 2
+	@docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Ports}}' | grep 9180 || echo "Warning: Container may not be running on port 9180"
+	@echo "==> Recent logs:"
+	@docker logs --tail 10 zotero-mcp-sse
 
 # Quick health check via MCP tool (requires server running locally)
 health:
