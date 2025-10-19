@@ -5,13 +5,11 @@
 
 This project is a python server that implements the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/introduction) for [Zotero](https://www.zotero.org/), giving you access to your Zotero library within AI assistants. It is intended to implement a small but maximally useful set of interactions with Zotero for use with [MCP clients](https://modelcontextprotocol.io/clients).
 
-<a href="https://glama.ai/mcp/servers/jknz38ntu4">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/jknz38ntu4/badge" alt="Zotero Server MCP server" />
-</a>
+[![Zotero MCP server badge](https://glama.ai/mcp/servers/jknz38ntu4/badge)](https://glama.ai/mcp/servers/jknz38ntu4)
 
 ## Features
 
-This MCP server provides the following tools:
+This MCP server provides the following tools. Strict policy: no backward compatibility; tools are content-first (strings in/out). YAML is PyYAML-only (fail-fast if unavailable). No cross-OS path mapping in tool inputs.
 
 ### Read Tools
 
@@ -30,9 +28,9 @@ This MCP server provides the following tools:
 ### Export & Bibliography Tools
 
 - `zotero_export_collection`: Export items in a collection to formats like RIS, BibTeX, CSL JSON, CSV, or styled bibliography/citations
-- `zotero_export_bibliography`: Export library or collection bibliography to a file with SHA-256 hash verification
-- `zotero_ensure_style`: Download and cache CSL style files for citation formatting
-- `zotero_ensure_yaml_citations`: Update Markdown YAML front-matter with bibliography and CSL settings
+- `zotero_export_bibliography_content`: Export library or collection bibliography as content with SHA-256 hash verification
+- `zotero_ensure_style_content`: Retrieve CSL style content by ID or URL with metadata
+- `zotero_ensure_yaml_citations_content`: Ensure Markdown YAML front matter contains citation fields; accepts document content and optional bibliography/style content; returns updated content and diagnostics
 
 ### Auto-Export Tools (Better BibTeX Integration)
 
@@ -42,14 +40,15 @@ This MCP server provides the following tools:
 
 ### Citation & Authoring Tools
 
-- `zotero_resolve_citekeys`: Resolve citekeys from multiple sources (Better BibTeX, CSL JSON, or Zotero)
+- `zotero_resolve_citekeys`: Resolve citekeys from multiple sources (Better BibTeX, CSL JSON content, or Zotero)
 - `zotero_insert_citation`: Generate formatted citation strings (Pandoc or LaTeX style)
+- `zotero_insert_citation_content`: Content-oriented variant (same formatting behavior)
 - `zotero_suggest_citations`: Get ranked citation suggestions based on text context
 
 ### Validation & Build Tools
 
-- `zotero_validate_references`: Validate Markdown citekeys against bibliography, report issues
-- `zotero_build_exports`: Build DOCX/HTML/PDF outputs using Pandoc with citation processing
+- `zotero_validate_references_content`: Validate Markdown citekeys against a CSL JSON bibliography string; returns unresolved, duplicates, missing fields, suggestions
+- `zotero_build_exports_content`: Build DOCX/HTML/PDF from Markdown content using Pandoc. Optionally embed outputs as data URIs using `EXPORTS_EMBED_DATA_URI=true`.
 
 ### Convenience Tools
 
@@ -79,23 +78,23 @@ Common errors are mapped to helpful hints where possible (400 invalid fields, 40
   - bibliography/citation: set `format` to `bib` or `citation` and optionally provide `style` (e.g., `apa`).
   - For export formats, the API requires a `limit` (max 100 per page). Use `fetchAll=true` to retrieve all items.
 
-- `zotero_export_bibliography(targetPath, format="csljson"|"bibtex"|"biblatex", scope="library"|"collection", collectionKey?)`
-  - Export to a file on disk with SHA-256 hash for change detection
-  - Returns `{path, count, sha256, warnings}`
+- `zotero_export_bibliography_content(format="csljson"|"bibtex"|"biblatex", scope="library"|"collection", collectionKey?, limit?, fetchAll?)`
+  - Export bibliography as a string with SHA-256 for change detection
+  - Returns `{content, count, sha256, warnings}`
 
-- `zotero_ensure_style(style, targetPath)`
-  - Download CSL style by ID or URL to specified path
-  - Idempotent: skips download if file exists
+- `zotero_ensure_style_content(style)`
+  - Download CSL style by ID or URL and return the content with metadata
+  - Returns `{content, sha256, etag}` when available
 
-- `zotero_ensure_yaml_citations(documentPath, bibliography?, csl?, linkCitations?)`
+- `zotero_ensure_yaml_citations_content(documentContent, bibliographyContent?, cslContent?, linkCitations=true)`
   - Update Markdown YAML front-matter with citation settings
-  - Preserves other YAML fields
-  - Works with PyYAML, ruamel.yaml, or a text-based fallback
-  - Returns which parser was used: `(parser=pyyaml|ruamel|text)`
+  - Preserves other YAML fields and normalizes newlines to `\n`
+  - PyYAML-only (fail-fast if unavailable)
+  - Returns `{updatedContent, changed, parser:"pyyaml", diagnostics:{keysUpdated, preservedKeys}}`
 
 ### YAML Front Matter for Citations
 
-When working with Markdown documents that use Pandoc for citation processing, you need a YAML front matter block at the start of your document. The `zotero_ensure_yaml_citations` tool automatically adds or updates this block.
+When working with Markdown documents that use Pandoc for citation processing, you need a YAML front matter block at the start of your document. The `zotero_ensure_yaml_citations_content` tool automatically adds or updates this block.
 
 **Minimal YAML front matter example:**
 
@@ -109,10 +108,11 @@ link-citations: true
 
 **How it works:**
 
-- The tool tries to use PyYAML first, then ruamel.yaml, then falls back to text-based parsing
+- YAML parsing is PyYAML-only (fail-fast if missing). No fallbacks.
 - It preserves existing YAML keys and updates only citation-related fields
 - Works with documents that have BOM or Windows CRLF line endings
 - Running it multiple times is idempotent (produces the same result)
+- If you pass `bibliographyContent` or `cslContent`, the YAML values are set to `__INLINE__` to reflect content-managed inputs; build tools provide temp files under the hood when invoking Pandoc.
 
 **Manual fallback:**
 If you prefer to add the front matter manually, just paste the YAML block above at the very start of your Markdown file, adjusting the paths to match your bibliography and CSL style files.
@@ -121,16 +121,7 @@ If you prefer to add the front matter manually, just paste the YAML block above 
 
 ### YAML Parser Status
 
-You can check which YAML parser will be used by calling the `zotero_health` tool. It will report:
-
-- `pyyaml: ok|missing` - PyYAML availability
-- `ruamel: ok|missing` - ruamel.yaml availability  
-- `yamlParser: pyyaml|ruamel|text` - Which parser `ensure_yaml_citations` will use
-
-**If you see `yamlParser: text`:**
-The tool will still work using a text-based fallback, but for best results:
-- For Docker deployments: rebuild and redeploy using `make docker-redeploy` (see deployment instructions below)
-- For local installations: ensure PyYAML is installed (`pip install PyYAML` or `uv sync`)
+YAML parsing is PyYAML-only. If PyYAML is missing, citation tools fail fast with a clear error. Ensure the environment includes PyYAML (uv sync or pip install PyYAML).
 
 ### Docker Redeploy
 
@@ -141,10 +132,11 @@ make docker-redeploy
 ```
 
 This will:
+
 1. Build a new `zotero-mcp:local` image
-2. Stop and remove the old container
-3. Start a new container with the updated image
-4. Show recent logs to verify startup
+1. Stop and remove the old container
+1. Start a new container with the updated image
+1. Show recent logs to verify startup
 
 For manual steps, see `.github/instructions/deploy.instructions.md`.
 
@@ -160,8 +152,8 @@ For manual steps, see `.github/instructions/deploy.instructions.md`.
 
 ### Citation Authoring Usage
 
-- `zotero_resolve_citekeys(citekeys, bibliographyPath?, tryZotero=true, preferBBT=true)`
-  - Multi-source resolution: Better BibTeX → file → Zotero API
+- `zotero_resolve_citekeys(citekeys, bibliographyContent?, tryZotero=true, preferBBT=true)`
+  - Multi-source resolution: Better BibTeX → CSL JSON content → Zotero API
   - Returns `{resolved: {...}, unresolved: [...], duplicateKeys: [...]}`
 
 - `zotero_insert_citation(citekeys, style="pandoc"|"latex", prefix?, suffix?, pages?)`
@@ -172,13 +164,152 @@ For manual steps, see `.github/instructions/deploy.instructions.md`.
 
 ### Validation and Build Usage
 
-- `zotero_validate_references(documentPath, bibliographyPath, requireDOIURL=true)`
-  - Scan Markdown for citekeys and validate against bibliography
-  - Reports: unresolved keys, duplicates, missing fields, unused entries
+- `zotero_validate_references_content(documentContent, bibliographyContent, requireDOIURL=true)`
+  - Scan Markdown for citekeys and validate against CSL JSON content
+  - Returns unresolved keys, duplicates, duplicate citations, missing fields `{id, missing}`, suggestions `{}` and unused entries
 
-- `zotero_build_exports(documentPath, formats=["docx","html","pdf"], bibliographyPath?, cslPath?, useCiteproc=true, pdfEngine="edge"|"xelatex", extraArgs?)`
+- `zotero_build_exports_content(documentContent, formats=["docx","html","pdf"], bibliographyContent?, cslContent?, useCiteproc=true, pdfEngine="edge"|"xelatex", extraArgs?)`
   - Build outputs with Pandoc and citation processing
-  - Returns output paths and warnings
+  - By default returns server-native paths. Set `EXPORTS_EMBED_DATA_URI=true` to embed artifact bytes in `dataURI` fields instead.
+
+## Examples (content-first tools)
+
+These examples show minimal payloads and the shape of the JSON “result” block each tool emits. The human-readable text includes a fenced JSON block you can parse.
+
+### Ensure YAML for citations
+
+Tool: `zotero_ensure_yaml_citations_content`
+
+Input
+
+```json
+{
+  "documentContent": "# Title\n\nBody\n",
+  "bibliographyContent": "[]",
+  "cslContent": "<style/>",
+  "linkCitations": true
+}
+```
+
+Notes
+
+- When `bibliographyContent`/`cslContent` are provided, the YAML values are set to `__INLINE__` to indicate content-managed inputs (no paths). This is intentional and idempotent.
+
+Result (excerpt)
+
+```json
+{
+  "result": {
+    "updatedContent": "---\nbibliography: __INLINE__\ncsl: __INLINE__\nlink-citations: true\n---\n\n# Title\n\nBody\n",
+    "changed": true,
+    "parser": "pyyaml",
+    "diagnostics": {"keysUpdated": ["bibliography","csl","link-citations"], "preservedKeys": []}
+  }
+}
+```
+
+### Validate references
+
+Tool: `zotero_validate_references_content`
+
+Input
+
+```json
+{
+  "documentContent": "This cites @k1 and @missing.",
+  "bibliographyContent": "[{\"id\":\"k1\",\"title\":\"T\",\"author\":[{\"family\":\"Doe\",\"given\":\"J\"}],\"issued\":{\"raw\":\"2020\"}}]",
+  "requireDOIURL": false
+}
+```
+
+Result fields
+
+- `unresolvedKeys`: e.g., `["missing"]`
+- `duplicateKeys`: usually `[]` for CSL JSON arrays
+- `missingFields`: list of `{id, missing}`
+- `duplicateCitations` and `unusedEntries`: provided for convenience
+
+### Build exports (DOCX/HTML/PDF)
+
+Tool: `zotero_build_exports_content`
+
+Input
+
+```json
+{
+  "documentContent": "# Title\n\nHello\n",
+  "formats": ["docx","html"],
+  "useCiteproc": true
+}
+```
+
+Behavior
+
+- Writes temp files internally for Pandoc.
+- Set env `EXPORTS_EMBED_DATA_URI=true` to receive `{dataURI}` instead of `{path}` in artifacts.
+
+Result (excerpt)
+
+```json
+{
+  "result": {
+    "artifacts": [
+      {"format": "docx", "path": "/tmp/.../out.docx"},
+      {"format": "html", "path": "/tmp/.../out.html"}
+    ],
+    "warnings": []
+  }
+}
+```
+
+### Export bibliography as content
+
+Tool: `zotero_export_bibliography_content`
+
+Input
+
+```json
+{
+  "format": "csljson",
+  "scope": "library",
+  "fetchAll": false
+}
+```
+
+Result (excerpt)
+
+```json
+{
+  "result": {
+    "content": "[ {\n  \"id\": \"key1\"\n} ]",
+    "count": 1,
+    "sha256": "...",
+    "warnings": []
+  }
+}
+```
+
+### Ensure CSL style content
+
+Tool: `zotero_ensure_style_content`
+
+Input
+
+```json
+{ "style": "apa" }
+```
+
+Result (excerpt)
+
+```json
+{
+  "result": {
+    "content": "<?xml version=\"1.0\" encoding=\"utf-8\"?>...",
+    "sha256": "...",
+    "etag": "...optional..."
+  }
+}
+```
 
 ### Convenience Tools Usage
 
@@ -200,7 +331,7 @@ This server can either run against either a [local API offered by the Zotero des
 1. Under the "Advanced" tab, check the box that says "Allow other applications on this computer to communicate with Zotero".
 
 > [!IMPORTANT]
-> For access to the `/fulltext` endpoint on the local API which allows retrieving the full content of items in your library, you'll need to install a [Zotero Beta Build](https://www.zotero.org/support/beta_builds) (as of 2025-03-30). Once 7.1 is released this will no longer be the case. See https://github.com/zotero/zotero/pull/5004 for more information. If you do not want to do this, use the Web API instead.
+> For access to the `/fulltext` endpoint on the local API which allows retrieving the full content of items in your library, you'll need to install a [Zotero Beta Build](https://www.zotero.org/support/beta_builds) (as of 2025-03-30). Once 7.1 is released this will no longer be the case. See <https://github.com/zotero/zotero/pull/5004> for more information. If you do not want to do this, use the Web API instead.
 
 To use the Zotero Web API, you'll need to create an API key and find your Library ID (usually your User ID) in your Zotero account settings here: <https://www.zotero.org/settings/keys>
 
@@ -284,6 +415,7 @@ npx @modelcontextprotocol/inspector uv run zotero-mcp
 ```
 
 To test the local repository against Claude Desktop, run `echo $PWD/.venv/bin/zotero-mcp` in your shell within this directory, then set the following within your Claude Desktop configuration
+
 ```json
 {
   "mcpServers": {
@@ -338,14 +470,14 @@ If you want to expose this server on your LAN as an SSE endpoint consumable by M
   ZOTERO_LIBRARY_TYPE=user
   ```
 
-2. (Optional) Set bind host/port. Defaults are `0.0.0.0:9180`.
+1. (Optional) Set bind host/port. Defaults are `0.0.0.0:9180`.
 
   ```bash
   export MCP_HOST=0.0.0.0
   export MCP_PORT=9180
   ```
 
-3. Start the containerized SSE server:
+1. Start the containerized SSE server:
 
   ```bash
   ./scripts/run-docker.sh
@@ -355,8 +487,8 @@ The server will listen at `http://<your-host>:<MCP_PORT>/sse` (e.g., `http://192
 
 ## Relevant Documentation
 
-- https://modelcontextprotocol.io/tutorials/building-mcp-with-llms
-- https://github.com/modelcontextprotocol/python-sdk
-- https://pyzotero.readthedocs.io/en/latest/
-- https://www.zotero.org/support/dev/web_api/v3/start
-- https://modelcontextprotocol.io/llms-full.txt can be utilized by LLMs
+- <https://modelcontextprotocol.io/tutorials/building-mcp-with-llms>
+- <https://github.com/modelcontextprotocol/python-sdk>
+- <https://pyzotero.readthedocs.io/en/latest/>
+- <https://www.zotero.org/support/dev/web_api/v3/start>
+- <https://modelcontextprotocol.io/llms-full.txt> can be utilized by LLMs

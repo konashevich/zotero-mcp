@@ -51,16 +51,15 @@ If you need to troubleshoot or prefer manual control, follow these steps exactly
 	docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Ports}}' | grep 9180
 	```
 	
-6. Check startup health and YAML parser availability
+6. Check startup health and YAML parser availability (PyYAML-only)
 	```bash
-	# Recent logs (look for startup health JSON with pyyaml/ruamel/yamlParser fields)
+	# Recent logs (look for startup health JSON with pyyaml and yamlParser fields)
 	docker logs --tail 50 zotero-mcp-sse
 	```
 	
 	The health output should include:
 	- `pyyaml: ok` - PyYAML is available
-	- `ruamel: ok` - ruamel.yaml is available  
-	- `yamlParser: pyyaml` - Indicates which parser ensure_yaml_citations will use
+	- `yamlParser: pyyaml` - YAML tools use PyYAML exclusively (fail-fast otherwise)
 	
 	Optional SSE probe:
 	```bash
@@ -69,43 +68,14 @@ If you need to troubleshoot or prefer manual control, follow these steps exactly
 	```
 
 Notes
-- The Dockerfile performs a lightweight YAML library check during build; failures should be addressed by ensuring dependencies are installed via `uv sync` in the image.
+- The Dockerfile performs a lightweight YAML library check during build; ensure PyYAML is installed via `uv sync` in the image.
 - Use `LOG_LEVEL=DEBUG` in `.env.local` if you want verbose startup/timing logs.
-- After redeployment, the `zotero_health` MCP tool will report enhanced diagnostics including YAML parser availability and selection.
+- After redeployment, the `zotero_health` MCP tool will report diagnostics including YAML parser selection (always `pyyaml`).
 
-## Windows paths from clients (important)
+## Content-based tools (no cross-OS path mapping)
 
-When the server runs in Linux/Docker but clients pass absolute Windows paths (e.g., `C:\\Users\\...`), the server now maps those paths on POSIX if a corresponding host drive is mounted. Configure one of the following to enable mapping:
+Public tools accept and return content (strings) to avoid cross-OS filesystem issues. Do not pass client file paths to tools. When external binaries like Pandoc require files, the server writes temporary files internally and returns either server-native paths or inline data URIs when `EXPORTS_EMBED_DATA_URI=true`.
 
-- ZOTERO_HOST_DRIVES_ROOT: Root under which host Windows drives are mounted. Common values:
-	- Docker Desktop: `/host_mnt`
-	- WSL: `/mnt`
-	Example mapping: `C:\\Users\\alice\\Docs\\paper.md` → `/host_mnt/c/Users/alice/Docs/paper.md`
-
-- Optional: Mount a specific host documents directory and set the base for relative paths:
-	- HOST_DOCS_DIR: Absolute path on host to mount (e.g., `C:\\Users\\alice\\Documents\\Manuscripts`)
-	- CONTAINER_DOCS_DIR: Where to mount inside container (default `/workspace`)
-	- ZOTERO_DOCS_BASE: Base dir inside container to resolve relative paths
-
-The `scripts/run-docker.sh` supports these variables. Example `.env.local` additions on Windows with Docker Desktop:
-
-```
-# Existing required values
-ZOTERO_API_KEY=...
-ZOTERO_LIBRARY_ID=...
-
-# Path mapping config
-HOST_DRIVES_ROOT=/host_mnt
-HOST_DOCS_DIR=C:\\Users\\alice\\Documents\\Manuscripts
-CONTAINER_DOCS_DIR=/workspace
-# Optional: if you only use relatives, set base without a mount
-# ZOTERO_DOCS_BASE=/workspace
-```
-
-Then redeploy:
-
-```bash
-make docker-redeploy
-```
-
-After redeploy, absolute Windows paths and relative paths under `ZOTERO_DOCS_BASE` will resolve correctly. If mapping fails, the tools will include a hint to set `ZOTERO_HOST_DRIVES_ROOT`.
+Implications:
+- No Windows-to-POSIX path mapping is documented or supported in tool inputs.
+- If you bind-mount host directories for operational reasons, treat any paths as server-native only and outside the scope of MCP tool inputs.

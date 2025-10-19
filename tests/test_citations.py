@@ -19,14 +19,13 @@ def test_insert_citation_latex() -> None:
     assert s == "\\parencite[42]{a,b}"
 
 
-def test_resolve_citekeys_from_csljson(tmp_path: Path) -> None:
+def test_resolve_citekeys_from_csljson_content(tmp_path: Path) -> None:
     items = [
         {"id": "key1", "title": "Paper A", "author": [{"family": "Doe", "given": "J"}]},
         {"id": "key2", "title": "Paper B", "author": [{"family": "Roe", "given": "R"}]},
     ]
-    p = tmp_path / "refs.json"
-    p.write_text(json.dumps(items), encoding="utf-8")
-    out = resolve_citekeys(["key1", "missing"], bibliographyPath=str(p))
+    bib_text = json.dumps(items)
+    out = resolve_citekeys(["key1", "missing"], bibliographyContent=bib_text)
     assert "Resolved: 1" in out
     assert "Unresolved: 1" in out
     assert "result" in out
@@ -69,5 +68,5 @@ def test_resolve_citekeys_prefer_bbt(monkeypatch: Any, tmp_path: Path) -> None:
     import urllib.request as _ureq
     monkeypatch.setattr(_ureq, "urlopen", fake_urlopen)
 
-    out = resolve_citekeys(["bbtKey"], bibliographyPath=None, tryZotero=False, preferBBT=True)
+    out = resolve_citekeys(["bbtKey"], bibliographyContent=None, tryZotero=False, preferBBT=True)
     assert "Resolved: 1" in out

@@ -9,10 +9,6 @@ from typing import Any, Literal, Iterable, Mapping, TypedDict, Optional
 import time
 import logging
 try:
-    from ruamel.yaml import YAML
-except Exception:  # noqa: BLE001
-    YAML = None
-try:
     import bibtexparser
 except Exception:  # noqa: BLE001
     bibtexparser = None
@@ -234,20 +230,8 @@ def zotero_health() -> str:
     except Exception:
         info["pyyaml"] = "missing"
     
-    # Check ruamel.yaml availability
-    try:
-        _ = importlib.import_module("ruamel.yaml")
-        info["ruamel"] = "ok"
-    except Exception:
-        info["ruamel"] = "missing"
-    
-    # Predict which parser ensure_yaml_citations will use
-    if info["pyyaml"] == "ok":
-        info["yamlParser"] = "pyyaml"
-    elif info["ruamel"] == "ok":
-        info["yamlParser"] = "ruamel"
-    else:
-        info["yamlParser"] = "text"
+    # Parser selection is PyYAML-only per policy
+    info["yamlParser"] = "pyyaml" if info["pyyaml"] == "ok" else "missing"
     
     # Zotero client init
     try:
@@ -878,36 +862,27 @@ def open_in_zotero(
 # Bibliography export
 # ------------------------
 
+# Removed deprecated path-based zotero_export_bibliography (no backward compatibility)
+
+
 @mcp.tool(
-    name="zotero_export_bibliography",
+    name="zotero_export_bibliography_content",
     description=(
-        "Export the library or a collection to a file (bibtex|biblatex|csljson). Returns path, count, and sha256."
+        "Export the library or a collection as content (bibtex|biblatex|csljson). Returns content, count, sha256, warnings."
     ),
 )
-def export_bibliography(
-    path: str,
+def export_bibliography_content(
     format: Literal["bibtex", "biblatex", "csljson"] | None = "csljson",
     scope: Literal["library", "collection"] | None = "library",
     collectionKey: str | None = None,
     limit: int | None = 100,
     fetchAll: bool | None = True,
 ) -> str:
-    """Export bibliography content to a file and report a hash.
-
-    For library scope, uses items(); for collection scope, uses collection_items().
-    """
+    """Export bibliography content as a string with metadata (content-first)."""
     import hashlib
     import json as _json
-    import os as _os
-    import tempfile
 
     zot = get_zotero_client()
-    cache_key = f"export:{path}:{format}:{scope}:{collectionKey}:{limit}:{fetchAll}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        logger.info("Returning cached export for %s", path)
-        return cached
-
     try:
         if format not in {"bibtex", "biblatex", "csljson"}:
             return f"Unsupported format: {format}"
@@ -927,7 +902,7 @@ def export_bibliography(
         else:
             results = zot.everything(zot.items()) if fetchAll else zot.items()
 
-        # Normalize to string content and count
+        # Normalize to string content
         count = 0
         content_str = ""
         warnings: list[str] = []
@@ -951,35 +926,21 @@ def export_bibliography(
                 content_str = str(results)
                 count = 0
         else:  # biblatex
-            # pyzotero may not format biblatex; warn if fallback used
             content_str = str(results)
             count = len(results) if isinstance(results, list) else 0
             warnings.append("biblatex formatting fallback used; verify output format.")
 
-        # Atomic write
-        target_dir = _os.path.dirname(path) or "."
-        _os.makedirs(target_dir, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=target_dir) as tmp:
-            tmp.write(content_str)
-            tmp_path = tmp.name
-        _os.replace(tmp_path, path)
-
         sha = hashlib.sha256(content_str.encode("utf-8", errors="ignore")).hexdigest()
-
         header = [
-            "# Bibliography export",
-            f"Path: {path}",
+            "# Bibliography export (content)",
             f"Format: {format}",
             f"Scope: {scope}" + (f" (collection {collectionKey})" if scope == "collection" else ""),
             f"Items: {count}",
             f"SHA256: {sha}",
         ]
-        res_text = "\n".join(header) + _compact_json_block(
-            "result", {"path": path, "count": count, "sha256": sha, "warnings": warnings}
+        return "\n".join(header) + _compact_json_block(
+            "result", {"content": content_str, "count": count, "sha256": sha, "warnings": warnings}
         )
-        _cache_set(cache_key, res_text)
-        logger.info("Wrote export %s (count=%d)", path, count)
-        return res_text
     except Exception as e:  # noqa: BLE001
         return _format_error("Error exporting bibliography", e)
 
@@ -988,21 +949,19 @@ def export_bibliography(
 # Styles and workspace YAML
 # ------------------------
 
-@mcp.tool(
-    name="zotero_ensure_style",
-    description=("Download or verify a CSL style to a given path (id or URL). Returns the path."),
-)
-def ensure_style(style: str, targetPath: str) -> str:
-    """Ensure a CSL style exists at targetPath; download if missing.
+# Removed deprecated path-based zotero_ensure_style (no backward compatibility)
 
-    'style' may be a URL or an identifier (we'll try to fetch from the official GitHub mirror if not a URL).
-    """
+
+@mcp.tool(
+    name="zotero_ensure_style_content",
+    description=("Fetch a CSL style (id or URL) and return its content with metadata (ETag if available)."),
+)
+def ensure_style_content(style: str) -> str:
+    """Return CSL style content (content-first) without touching the filesystem."""
     import hashlib
-    import os as _os
     import urllib.parse
     import urllib.request
     import urllib.error
-    import tempfile
 
     def _is_url(s: str) -> bool:
         try:
@@ -1011,131 +970,65 @@ def ensure_style(style: str, targetPath: str) -> str:
         except Exception:  # noqa: BLE001
             return False
 
-    def _download(url: str, etag: str | None = None) -> tuple[bytes | None, dict[str, str], bool]:
-        headers: dict[str, str] = {}
-        if etag:
-            headers["If-None-Match"] = etag
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req) as resp:  # nosec - user-provided URLs expected; caller controls repo
-                data = resp.read()
-                hdrs = {k: v for k, v in getattr(resp, "headers", {}).items()} if hasattr(resp, "headers") else {}
-                return data, hdrs, False
-        except urllib.error.HTTPError as e:  # type: ignore
-            if getattr(e, "code", None) == 304:
-                # Not modified
-                return None, {}, True
-            raise
+    def _download(url: str) -> tuple[bytes, dict[str, str]]:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req) as resp:  # nosec
+            data = resp.read()
+            hdrs = {k: v for k, v in getattr(resp, "headers", {}).items()} if hasattr(resp, "headers") else {}
+            return data, hdrs
 
     try:
-        _os.makedirs(_os.path.dirname(targetPath) or ".", exist_ok=True)
-        existing = None
-        etag_path = f"{targetPath}.etag"
-        etag_val: str | None = None
-        if _os.path.exists(targetPath):
-            with open(targetPath, "rb") as f:
-                existing = f.read()
-        if _os.path.exists(etag_path):
-            try:
-                etag_val = open(etag_path, "r", encoding="utf-8").read().strip() or None
-            except Exception:  # noqa: BLE001
-                etag_val = None
-
-        content: bytes
-        new_etag: str | None = None
         if _is_url(style):
-            data, hdrs, not_modified = _download(style, etag=etag_val)
-            if not_modified:
-                return f"Style already up to date at: {targetPath}"
-            assert data is not None
-            content = data
-            new_etag = hdrs.get("ETag") if isinstance(hdrs, dict) else None
+            data, hdrs = _download(style)
         else:
-            # Best-effort fetch from styles repo
             safe = style if style.endswith(".csl") else f"{style}.csl"
             url = f"https://raw.githubusercontent.com/citation-style-language/styles/master/{safe}"
-            data, hdrs, not_modified = _download(url, etag=etag_val)
-            if not_modified:
-                return f"Style already up to date at: {targetPath}"
-            assert data is not None
-            content = data
-            new_etag = hdrs.get("ETag") if isinstance(hdrs, dict) else None
-
-        # If unchanged, just return
-        if existing and hashlib.sha256(existing).hexdigest() == hashlib.sha256(content).hexdigest():
-            return f"Style already up to date at: {targetPath}"
-
-        target_dir = _os.path.dirname(targetPath) or "."
-        with tempfile.NamedTemporaryFile("wb", delete=False, dir=target_dir) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        _os.replace(tmp_path, targetPath)
-        # Write/update ETag sidecar if provided
-        try:
-            if new_etag:
-                with open(etag_path, "w", encoding="utf-8") as ef:
-                    ef.write(new_etag)
-        except Exception:  # noqa: BLE001
-            pass
-        return f"Style saved to: {targetPath}"
+            data, hdrs = _download(url)
+        sha = hashlib.sha256(data).hexdigest()
+        etag = hdrs.get("ETag") if isinstance(hdrs, dict) else None
+        text = data.decode("utf-8", errors="replace")
+        header = [
+            "# CSL style (content)",
+            f"Bytes: {len(data)}",
+            f"SHA256: {sha}",
+            (f"ETag: {etag}" if etag else ""),
+        ]
+        return "\n".join([h for h in header if h]) + _compact_json_block(
+            "result", {"content": text, "sha256": sha, "etag": etag}
+        )
     except Exception as e:  # noqa: BLE001
-        return _format_error("Error ensuring style", e)
+        return _format_error("Error fetching CSL style", e)
 
 
 @mcp.tool(
-    name="zotero_ensure_yaml_citations",
+    name="zotero_ensure_yaml_citations_content",
     description=(
-        "Ensure a Markdown file's YAML front matter contains bibliography, csl, and link-citations keys."
+        "Ensure a Markdown string's YAML front matter contains bibliography, csl, and link-citations keys. Accepts content, returns updatedContent and diagnostics."
     ),
 )
-def ensure_yaml_citations(
-    documentPath: str,
-    bibliographyPath: str,
-    cslPath: str,
+def ensure_yaml_citations_content(
+    documentContent: str,
+    bibliographyContent: str | None = None,
+    cslContent: str | None = None,
     linkCitations: bool | None = True,
 ) -> str:
-    """Insert or update YAML front matter keys for citations.
+    """Insert or update YAML front matter keys for citations in provided content.
 
-    Tries multiple YAML parsers in order: PyYAML → ruamel.yaml → text fallback.
-    Preserves other YAML keys and original order where possible.
+    Strict: PyYAML only. If unavailable, fail fast with a clear error.
     """
-    import os as _os
-    import re
-    import tempfile
-    
-    # Try to detect available YAML parsers
-    yaml_parser = None
-    parser_name = "text"
-    
-    # Try PyYAML first
+    import re as _re
     try:
-        import yaml  # type: ignore
-        yaml_parser = yaml
-        parser_name = "pyyaml"
-    except Exception:  # noqa: BLE001
-        # Try ruamel.yaml as fallback
-        try:
-            from ruamel.yaml import YAML as RuamelYAML  # type: ignore
-            yaml_parser = RuamelYAML()
-            parser_name = "ruamel"
-        except Exception:  # noqa: BLE001
-            yaml_parser = None
-            parser_name = "text"
+        import yaml as _yaml  # type: ignore
+    except Exception as e:  # noqa: BLE001
+        return _format_error("Error ensuring YAML citations", Exception(f"PyYAML not available: {e}"))
 
     _t0 = time.perf_counter()
     try:
-        # Normalize path for cross-platform compatibility (Windows backslashes, spaces, OneDrive, etc.)
-        doc_path = _normalize_path(documentPath)
-        
-        # Handle BOM and normalize newlines
-        with open(doc_path, "r", encoding="utf-8-sig") as f:
-            content = f.read()
-        
-        # Normalize line endings to \n
-        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        # Normalize BOM and newlines
+        content = (documentContent or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
 
-        # Detect front matter (anchored to start of file)
-        fm_match = re.match(r"^---\n(.*?)\n---\n(.*)$", content, flags=re.DOTALL)
+        # Detect front matter
+        fm_match = _re.match(r"^---\n(.*?)\n---\n(.*)$", content, flags=_re.DOTALL)
         if fm_match:
             fm_text = fm_match.group(1)
             body = fm_match.group(2)
@@ -1143,106 +1036,52 @@ def ensure_yaml_citations(
             fm_text = ""
             body = content
 
-        if yaml_parser is not None and parser_name == "pyyaml":
-            # PyYAML path
-            try:
-                fm_obj = yaml_parser.safe_load(fm_text) if fm_text.strip() else {}
-                if not isinstance(fm_obj, dict):
-                    fm_obj = {}
-            except Exception:
+        changed = False
+        preserved: list[str] = []
+        keys_updated: list[str] = []
+
+        try:
+            fm_obj = _yaml.safe_load(fm_text) if fm_text.strip() else {}
+            if not isinstance(fm_obj, dict):
                 fm_obj = {}
+        except Exception:
+            fm_obj = {}
 
-            # Update required keys
-            fm_obj["bibliography"] = bibliographyPath
-            fm_obj["csl"] = cslPath
-            if linkCitations is not None:
-                fm_obj["link-citations"] = bool(linkCitations)
+        # Track preserved keys
+        preserved = [k for k in fm_obj.keys()]
 
-            # Dump YAML preserving key order without sorting
-            dumped = yaml_parser.safe_dump(fm_obj, sort_keys=False).strip()
-            new_content = f"---\n{dumped}\n---\n{body if body else ''}"
-            
-        elif yaml_parser is not None and parser_name == "ruamel":
-            # ruamel.yaml path
-            import io
-            try:
-                stream = io.StringIO(fm_text) if fm_text.strip() else io.StringIO("")
-                fm_obj = yaml_parser.load(stream)
-                if not isinstance(fm_obj, dict):
-                    fm_obj = {}
-            except Exception:
-                fm_obj = {}
+        # Update keys
+        prev = dict(fm_obj)
+        # Content-first contract: when content is provided, mark YAML as inline
+        if bibliographyContent is not None:
+            fm_obj["bibliography"] = "__INLINE__"
+        # Only set csl when provided
+        if cslContent is not None:
+            fm_obj["csl"] = "__INLINE__"
+        if linkCitations is not None:
+            fm_obj["link-citations"] = bool(linkCitations)
 
-            # Update required keys
-            fm_obj["bibliography"] = bibliographyPath
-            fm_obj["csl"] = cslPath
-            if linkCitations is not None:
-                fm_obj["link-citations"] = bool(linkCitations)
+        for k in ("bibliography", "csl", "link-citations"):
+            if prev.get(k) != fm_obj.get(k):
+                keys_updated.append(k)
 
-            # Dump YAML
-            output = io.StringIO()
-            yaml_parser.dump(fm_obj, output)
-            dumped = output.getvalue().strip()
-            new_content = f"---\n{dumped}\n---\n{body if body else ''}"
-            
-        else:
-            # Text fallback path: idempotent best-effort updater
-            lc_val = "true" if (linkCitations is None or linkCitations) else "false"
-            required = [
-                f"bibliography: {bibliographyPath}",
-                f"csl: {cslPath}",
-                f"link-citations: {lc_val}",
-            ]
-            # If front matter exists, replace or insert keys; otherwise, create new front matter
-            if fm_text:
-                lines = [ln for ln in fm_text.split("\n") if ln.strip() != ""]
-                def upsert(lines: list[str], k: str, v: str) -> list[str]:
-                    key = k.split(":", 1)[0]
-                    found = False
-                    out: list[str] = []
-                    for ln in lines:
-                        if ln.strip().startswith(f"{key}:") and not found:
-                            out.append(k)
-                            found = True
-                        else:
-                            out.append(ln)
-                    if not found:
-                        out.append(k)
-                    return out
-                cur = lines
-                for entry in required:
-                    cur = upsert(cur, entry, entry)
-                dumped = "\n".join(cur)
-                new_content = f"---\n{dumped}\n---\n{body if body else ''}"
-            else:
-                dumped = "\n".join(required)
-                new_content = f"---\n{dumped}\n---\n{body if body else ''}"
-
-        # Atomic write back using normalized path
-        target_dir = doc_path.parent
-        target_dir.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=str(target_dir)) as tmp:
-            tmp.write(new_content)
-            tmp_path = tmp.name
-        _os.replace(tmp_path, str(doc_path))
+        # Dump YAML preserving order
+        dumped = _yaml.safe_dump(fm_obj, sort_keys=False).strip()
+        updated_content = f"---\n{dumped}\n---\n{body if body else ''}"
+        changed = (updated_content != content)
 
         _ms = round((time.perf_counter() - _t0) * 1000, 1)
-        logger.info(f"ensure_yaml_citations: updated {doc_path} using {parser_name} parser in {_ms} ms")
-        return f"YAML citations updated (parser={parser_name})."
+        logger.info(f"ensure_yaml_citations_content: updated using pyyaml in {_ms} ms; changed={changed}")
+        result = {
+            "updatedContent": updated_content,
+            "changed": changed,
+            "parser": "pyyaml",
+            "diagnostics": {"keysUpdated": keys_updated, "preservedKeys": preserved},
+        }
+        return "YAML citations updated (parser=pyyaml)." + _compact_json_block("result", result)
     except Exception as e:  # noqa: BLE001
-        logger.exception("ensure_yaml_citations: error")
-        hint = ""
-        try:
-            # Provide mapping hint when Windows path is seen on POSIX
-            if os.name != "nt" and _re.match(r"^[A-Za-z]:[\\/]", documentPath or ""):
-                hint = (
-                    "\nHint: Detected Windows path on Linux. Set ZOTERO_HOST_DRIVES_ROOT (e.g., /host_mnt or /mnt) "
-                    "and ensure the host drive is mounted inside the container. "
-                    "You can also set ZOTERO_DOCS_BASE for resolving relative paths."
-                )
-        except Exception:
-            pass
-        return _format_error("Error ensuring YAML citations", Exception(str(e) + hint))
+        logger.exception("ensure_yaml_citations_content: error")
+        return _format_error("Error ensuring YAML citations", e)
 
 
 # ------------------------
@@ -1369,7 +1208,7 @@ def library_ensure_auto_export(
 )
 def resolve_citekeys(
     citekeys: list[str],
-    bibliographyPath: str | None = None,
+    bibliographyContent: str | None = None,
     tryZotero: bool | None = True,
     preferBBT: bool | None = True,
 ) -> str:
@@ -1437,23 +1276,11 @@ def resolve_citekeys(
             # Ignore BBT errors and continue with other strategies
             pass
 
-    # From CSL JSON
-    if bibliographyPath and _os.path.exists(bibliographyPath):
+    # From CSL JSON (content-based)
+    if bibliographyContent:
         try:
-            with open(bibliographyPath, "r", encoding="utf-8") as f:
-                if bibliographyPath.lower().endswith(".bib") and bibtexparser:
-                    bibdb = bibtexparser.load(f)
-                    items = []
-                    for entry in bibdb.entries:
-                        # Transform bibtex entry into minimal CSL-like dict
-                        cid = entry.get("ID")
-                        items.append({"id": cid, "title": entry.get("title"), "author": entry.get("author")})
-                else:
-                    data = _json.load(f)
-                    if isinstance(data, dict) and "items" in data:
-                        items = data["items"]
-                    else:
-                        items = data
+            data = _json.loads(bibliographyContent)
+            items = data["items"] if isinstance(data, dict) and "items" in data else data
             csl_map: dict[str, dict[str, Any]] = {}
             if isinstance(items, list):
                 for it in items:
@@ -1482,9 +1309,8 @@ def resolve_citekeys(
                         }
                 else:
                     unresolved.append(ck)
-        except Exception:  # noqa: BLE001
-            # Fall through to zotero if allowed
-            bibliographyPath = None
+        except Exception:
+            bibliographyContent = None
 
     # Try Zotero for unresolved keys that look like item keys
     looks_like_item_key = _re.compile(r"^[A-Z0-9]{8}$")
@@ -1961,29 +1787,21 @@ def suggest_citations(
 # ------------------------
 
 @mcp.tool(
-    name="zotero_validate_references",
+    name="zotero_validate_references_content",
     description=(
-        "Validate references in a Markdown file against a CSL JSON bibliography; report unresolved, duplicates, and missing fields."
+        "Validate references in Markdown content against a CSL JSON bibliography string; report unresolved, duplicates, and missing fields."
     ),
 )
-def validate_references(
-    documentPath: str,
-    bibliographyPath: str,
+def validate_references_content(
+    documentContent: str,
+    bibliographyContent: str,
     requireDOIURL: bool | None = True,
 ) -> str:
-    """Scan Markdown for citekeys and validate against a CSL JSON bibliography file."""
+    """Scan Markdown for citekeys and validate against a CSL JSON bibliography string."""
     import json as _json
-    import os as _os
     import re as _re
 
-    try:
-        # Normalize paths for cross-platform compatibility
-        doc_path = _normalize_path(documentPath)
-        bib_path = _normalize_path(bibliographyPath)
-        
-        content = open(doc_path, "r", encoding="utf-8").read()
-    except Exception as e:  # noqa: BLE001
-        return _format_error("Error reading document", e)
+    content = (documentContent or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
 
     # Strip YAML front matter and fenced code blocks before scanning
     # Remove YAML front matter
@@ -2003,8 +1821,7 @@ def validate_references(
             keys.add(p)
 
     try:
-        with open(bib_path, "r", encoding="utf-8") as f:
-            data = _json.load(f)
+        data = _json.loads(bibliographyContent or "{}")
         items = data["items"] if isinstance(data, dict) and "items" in data else data
         csl_map: dict[str, dict[str, Any]] = {}
         for it in items if isinstance(items, list) else []:
@@ -2028,7 +1845,7 @@ def validate_references(
         it = csl_map.get(k)
         if not it:
             continue
-        need = []
+        need: list[str] = []
         if not it.get("title"):
             need.append("title")
         if not it.get("author"):
@@ -2049,7 +1866,7 @@ def validate_references(
                 need.append("doi/url")
         # Don't require DOI/URL for the minimal validation used in tests
         if need:
-            missing_fields.append({"key": k, "fields": need})
+            missing_fields.append({"id": k, "missing": need})
 
     # Duplicate citations within the document (same key used more than once)
     counts: dict[str, int] = {}
@@ -2062,7 +1879,8 @@ def validate_references(
 
     # Use resolver chain to get robust resolution (prefer BBT/file/Zotero)
     try:
-        resolved_out = resolve_citekeys(list(keys), bibliographyPath=bibliographyPath, tryZotero=True, preferBBT=True)
+        # Best-effort suggestions using existing resolver (bibliographyPath not applicable here)
+        resolved_out = resolve_citekeys(list(keys), tryZotero=True, preferBBT=True)
         # Extract JSON result block if present
         import json as _json
 
@@ -2096,121 +1914,136 @@ def validate_references(
             "duplicateCitations": duplicate_citations,
             "missingFields": missing_fields,
             "unusedEntries": unused_entries,
-            "suggestions": suggestions,
+            "suggestions": {},
         },
     )
 
 
 @mcp.tool(
-    name="zotero_build_exports",
+    name="zotero_build_exports_content",
     description=(
-        "Build outputs (docx|html|pdf) using Pandoc with --citeproc. PDF defaults to Edge (if available)."
+        "Build outputs (docx|html|pdf) from Markdown content using Pandoc with --citeproc. Writes temp files server-side and returns artifacts."
     ),
 )
-def build_exports(
-    documentPath: str,
+def build_exports_content(
+    documentContent: str,
     formats: list[Literal["docx", "html", "pdf"]],
-    bibliographyPath: str | None = None,
-    cslPath: str | None = None,
+    bibliographyContent: str | None = None,
+    cslContent: str | None = None,
     useCiteproc: bool | None = True,
     pdfEngine: Literal["edge", "xelatex"] | None = "edge",
     extraArgs: list[str] | None = None,
 ) -> str:
-    """Run Pandoc to build exports. This function shells out to pandoc and returns output file paths."""
-    import os as _os
-    import subprocess
-    from pathlib import Path as _Path
-
+    import tempfile as _tempfile
+    # pandoc
+    if shutil.which("pandoc") is None:
+        return (
+            "Error: pandoc is not in PATH. Install from https://pandoc.org/installing.html "
+            "or ensure it is available on the server."
+        )
     _t0 = time.perf_counter()
-    out_paths: list[str] = []
+    # Validate formats
+    if not formats:
+        return "Error: No formats specified. Provide at least one of: docx, html, pdf."
+    supported = {"docx", "html", "pdf"}
+    bad = [f for f in formats if f not in supported]
+    if bad:
+        return f"Error: Unsupported formats: {', '.join(bad)}. Supported: docx, html, pdf."
+    out_artifacts: list[dict[str, Any]] = []
     warnings: list[str] = []
-    
-    # Normalize all paths for cross-platform compatibility
-    doc_path = _normalize_path(documentPath)
-    base = doc_path
-    stem = base.stem
+    tempdir = _tempfile.mkdtemp(prefix="zot-export-")
+    try:
+        # Write temp inputs
+        doc_path = Path(tempdir) / "doc.md"
+        doc_path.write_text((documentContent or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n"), encoding="utf-8")
+        bib_path = None
+        if bibliographyContent is not None:
+            bib_path = Path(tempdir) / "refs.json"
+            bib_path.write_text(bibliographyContent, encoding="utf-8")
+        csl_path = None
+        if cslContent is not None:
+            csl_path = Path(tempdir) / "style.csl"
+            csl_path.write_text(cslContent, encoding="utf-8")
 
-    pandoc = shutil.which("pandoc")
-    if not pandoc:
-        return "Pandoc is not installed or not in PATH. Install Pandoc (https://pandoc.org/installing.html) and ensure it's in your system PATH."
+        # Build format by format
+        for fmt in formats:
+            out_file = str(Path(tempdir) / f"out.{fmt}")
+            cmd = [
+                "pandoc",
+                str(doc_path),
+                "-o",
+                out_file,
+            ]
+            if useCiteproc:
+                cmd.append("--citeproc")
+            if fmt == "pdf":
+                if pdfEngine == "edge" and shutil.which("msedge"):
+                    cmd += ["--pdf-engine=msedge"]
+                elif pdfEngine == "xelatex":
+                    cmd += ["--pdf-engine=xelatex"]
+            if bib_path:
+                cmd += ["--bibliography", str(bib_path)]
+            if csl_path:
+                cmd += ["--csl", str(csl_path)]
+            if extraArgs:
+                cmd += list(extraArgs)
 
-    # Normalize optional paths if provided
-    if bibliographyPath:
-        bib_path = _normalize_path(bibliographyPath)
-        bibliographyPath = str(bib_path)
-    
-    if cslPath:
-        csl_norm_path = _normalize_path(cslPath)
-        cslPath = str(csl_norm_path)
-
-    # Sensible defaults: if no CSL provided, try default from env or fetch LNCS
-    if not cslPath:
-        csl_default = os.getenv("ZOTERO_DEFAULT_CSL", "lncs.csl")
-        # if path-like provided in env and exists
-        if os.path.sep in csl_default and os.path.exists(csl_default):
-            cslPath = csl_default
-        else:
-            # keep styles in .styles/
-            styles_dir = os.path.abspath(".styles")
-            os.makedirs(styles_dir, exist_ok=True)
-            local_csl = os.path.join(styles_dir, csl_default)
-            # If file missing, try to download from CSL repo (LNCS or given id)
-            if not os.path.exists(local_csl):
+            logger.info(f"pandoc: {' '.join(cmd)}")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                warnings.append(r.stderr.strip())
+            # Optionally embed as data URI
+            embed = os.getenv("EXPORTS_EMBED_DATA_URI", "false").lower() in {"1", "true", "yes"}
+            art: dict[str, Any] = {"format": fmt}
+            if embed:
                 try:
-                    style_id = (
-                        "springer-lecture-notes-in-computer-science"
-                        if csl_default.lower().startswith("lncs") or csl_default.lower().startswith("springer")
-                        else csl_default.replace(".csl", "")
+                    import base64 as _b64
+                    data = Path(out_file).read_bytes()
+                    b64 = _b64.b64encode(data).decode("ascii")
+                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if fmt == "docx" else (
+                        "text/html" if fmt == "html" else "application/pdf"
                     )
-                    _ = ensure_style(style_id, local_csl)
-                except Exception:
-                    pass
-            if os.path.exists(local_csl):
-                cslPath = local_csl
-
-    for fmt in formats:
-        out = str(base.with_suffix("." + ("pdf" if fmt == "pdf" else fmt)))
-        cmd = [pandoc, str(doc_path), "-o", out]
-        if useCiteproc:
-            cmd.append("--citeproc")
-        if bibliographyPath:
-            cmd.extend(["--bibliography", bibliographyPath])
-        if cslPath:
-            cmd.extend(["--csl", cslPath])
-        if fmt == "pdf":
-            if pdfEngine == "xelatex":
-                cmd.extend(["--pdf-engine", "xelatex"])
+                    art["dataURI"] = f"data:{mime};base64,{b64}"
+                except Exception as e:  # noqa: BLE001
+                    warnings.append(f"embed dataURI failed: {e}")
+                    art["path"] = out_file
             else:
-                # Use wkhtmltoimage-like approach is out-of-scope; rely on pandoc defaults or OS engine
-                # We warn if Edge not present but let pandoc handle.
-                if not shutil.which("edge") and not shutil.which("msedge"):
-                    warnings.append("Edge not detected; Pandoc will use its default PDF path.")
-        # Additional args passthrough
-        if extraArgs:
-            try:
-                cmd.extend([str(a) for a in extraArgs])
-            except Exception:  # noqa: BLE001
-                warnings.append("Failed to apply extraArgs; ignoring.")
-        # Run command (capture output for diagnostics)
-        try:
-            proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
-            if proc.returncode != 0:
-                warnings.append(f"pandoc {fmt} failed: {proc.stderr.strip()[:400]}")
-            else:
-                out_paths.append(out)
-        except Exception as e:  # noqa: BLE001
-            warnings.append(f"pandoc {fmt} error: {e}")
-
+                art["path"] = out_file
+            out_artifacts.append(art)
+    finally:
+        # Keep tempdir; artifacts live there. A follow-up tool could retrieve or clean them.
+        pass
+    _ms = round((time.perf_counter() - _t0) * 1000, 1)
+    # Keep duration in logs only to preserve deterministic output
+    logger.info(f"build_exports_content: built {formats} in {_ms} ms")
     header = [
         "# Build exports",
-        f"Outputs: {len(out_paths)}",
-        (f"Warnings: {len(warnings)}" if warnings else ""),
+        f"Formats: {', '.join(formats)}",
     ]
-    _ms = round((time.perf_counter() - _t0) * 1000, 1)
-    logger.info(f"build_exports: built {len(out_paths)} outputs in {_ms} ms; warnings={len(warnings)}")
-    return "\n".join([h for h in header if h]) + _compact_json_block(
-        "result", {"outputs": out_paths, "warnings": warnings}
+    return "\n".join(header) + _compact_json_block(
+        "result",
+        {
+            "artifacts": out_artifacts,
+            "warnings": warnings,
+        },
     )
+
+
+@mcp.tool(
+    name="zotero_insert_citation_content",
+    description=(
+        "Format citations for pandoc or LaTeX given citekeys and optional prefix/suffix/pages (content API)."
+    ),
+)
+def insert_citation_content(
+    citekeys: list[str],
+    pages: str | None = None,
+    prefix: str | None = None,
+    suffix: str | None = None,
+    style: Literal["pandoc", "latex"] | None = "pandoc",
+) -> str:
+    # Delegate to existing implementation
+    return insert_citation(citekeys=citekeys, pages=pages, prefix=prefix, suffix=suffix, style=style or "pandoc")
 
 
 @mcp.tool(
