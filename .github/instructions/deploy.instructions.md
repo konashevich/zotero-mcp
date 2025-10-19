@@ -72,3 +72,40 @@ Notes
 - The Dockerfile performs a lightweight YAML library check during build; failures should be addressed by ensuring dependencies are installed via `uv sync` in the image.
 - Use `LOG_LEVEL=DEBUG` in `.env.local` if you want verbose startup/timing logs.
 - After redeployment, the `zotero_health` MCP tool will report enhanced diagnostics including YAML parser availability and selection.
+
+## Windows paths from clients (important)
+
+When the server runs in Linux/Docker but clients pass absolute Windows paths (e.g., `C:\\Users\\...`), the server now maps those paths on POSIX if a corresponding host drive is mounted. Configure one of the following to enable mapping:
+
+- ZOTERO_HOST_DRIVES_ROOT: Root under which host Windows drives are mounted. Common values:
+	- Docker Desktop: `/host_mnt`
+	- WSL: `/mnt`
+	Example mapping: `C:\\Users\\alice\\Docs\\paper.md` → `/host_mnt/c/Users/alice/Docs/paper.md`
+
+- Optional: Mount a specific host documents directory and set the base for relative paths:
+	- HOST_DOCS_DIR: Absolute path on host to mount (e.g., `C:\\Users\\alice\\Documents\\Manuscripts`)
+	- CONTAINER_DOCS_DIR: Where to mount inside container (default `/workspace`)
+	- ZOTERO_DOCS_BASE: Base dir inside container to resolve relative paths
+
+The `scripts/run-docker.sh` supports these variables. Example `.env.local` additions on Windows with Docker Desktop:
+
+```
+# Existing required values
+ZOTERO_API_KEY=...
+ZOTERO_LIBRARY_ID=...
+
+# Path mapping config
+HOST_DRIVES_ROOT=/host_mnt
+HOST_DOCS_DIR=C:\\Users\\alice\\Documents\\Manuscripts
+CONTAINER_DOCS_DIR=/workspace
+# Optional: if you only use relatives, set base without a mount
+# ZOTERO_DOCS_BASE=/workspace
+```
+
+Then redeploy:
+
+```bash
+make docker-redeploy
+```
+
+After redeploy, absolute Windows paths and relative paths under `ZOTERO_DOCS_BASE` will resolve correctly. If mapping fails, the tools will include a hint to set `ZOTERO_HOST_DRIVES_ROOT`.

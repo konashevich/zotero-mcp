@@ -3,6 +3,8 @@ import typing as _typing
 import shutil
 import urllib
 import subprocess
+from pathlib import Path
+import re as _re
 from typing import Any, Literal, Iterable, Mapping, TypedDict, Optional
 import time
 import logging
@@ -35,6 +37,90 @@ if not logger.handlers:
             handler.formatter.converter = time.gmtime  # type: ignore[attr-defined]
         except Exception:
             pass
+
+
+# Path normalization helper for cross-platform compatibility
+def _normalize_path(path_str: str) -> Path:
+    """Normalize file paths for cross-platform use.
+
+    Handles these cases:
+    - Windows absolute paths (e.g., C:\\Users\\...) when running on POSIX/Linux
+      by mapping to a mounted host drive root if available.
+    - Relative paths, optionally resolved against ZOTERO_DOCS_BASE if set.
+    - Tilde (~) expansion.
+
+    Environment variables supported:
+    - ZOTERO_HOST_DRIVES_ROOT: Root under which Windows drives are mounted (e.g., /host_mnt or /mnt)
+      If set, a path like C:\\Users\\foo becomes {ZOTERO_HOST_DRIVES_ROOT}/c/Users/foo.
+    - ZOTERO_DOCS_BASE: Base directory to resolve relative paths from.
+    """
+    s = (path_str or "").strip().strip('"').strip("'")
+
+    # Detect Windows absolute path patterns like C:\\ or C:/
+    win_abs = bool(_re.match(r"^[A-Za-z]:[\\/]", s)) or s.startswith("\\\\")
+
+    # If we're on non-Windows and the input is a Windows absolute path, try to map it
+    if os.name != "nt" and win_abs:
+        # Drive-letter based path (ignore UNC for now unless explicitly mapped)
+        if _re.match(r"^[A-Za-z]:[\\/]", s):
+            drive = s[0].lower()
+            rest = s[2:].lstrip("\\/")
+            rest_posix = rest.replace("\\", "/")
+
+            # Determine candidate drive roots to try
+            roots: list[tuple[Path, str]] = []
+            env_root = os.getenv("ZOTERO_HOST_DRIVES_ROOT") or os.getenv("HOST_DRIVES_ROOT")
+            if env_root:
+                roots.append((Path(env_root), "env"))
+            # Common Docker Desktop and WSL mount points
+            roots.extend([
+                (Path("/host_mnt"), "host_mnt"),  # Docker Desktop
+                (Path("/mnt"), "mnt"),            # WSL or Linux
+            ])
+
+            # Try root/drive (e.g., /host_mnt/c, /mnt/c)
+            for root, _tag in roots:
+                drive_root = root / drive
+                if drive_root.exists():
+                    cand = drive_root / rest_posix
+                    return cand
+
+            # Fallback: some setups expose /c directly
+            direct = Path(f"/{drive}") / rest_posix
+            if direct.parent.exists():
+                return direct
+
+            # No mapping found; return as-is Path so caller can fail with a helpful error
+            return Path(s)
+        else:
+            # UNC path on POSIX is not directly accessible without mapping; return as Path(s)
+            return Path(s)
+
+    # Normal POSIX/Windows local behavior
+    p = Path(s)
+
+    # Expand ~ if present
+    try:
+        p = p.expanduser()
+    except Exception:
+        pass
+
+    # If path is relative and a base is provided, resolve against it
+    if not p.is_absolute():
+        base = os.getenv("ZOTERO_DOCS_BASE")
+        if base:
+            p = Path(base) / p
+
+    # Resolve to absolute path (handles relative paths and normalizes)
+    try:
+        p = p.resolve()
+    except Exception:
+        # If resolve fails (e.g., non-existent path), at least get absolute
+        try:
+            p = p.absolute()
+        except Exception:
+            pass
+    return p
 
 # Simple in-memory TTL cache and rate limiter
 _CACHE: dict[str, tuple[float, Any]] = {}
@@ -1038,8 +1124,11 @@ def ensure_yaml_citations(
 
     _t0 = time.perf_counter()
     try:
+        # Normalize path for cross-platform compatibility (Windows backslashes, spaces, OneDrive, etc.)
+        doc_path = _normalize_path(documentPath)
+        
         # Handle BOM and normalize newlines
-        with open(documentPath, "r", encoding="utf-8-sig") as f:
+        with open(doc_path, "r", encoding="utf-8-sig") as f:
             content = f.read()
         
         # Normalize line endings to \n
@@ -1129,20 +1218,31 @@ def ensure_yaml_citations(
                 dumped = "\n".join(required)
                 new_content = f"---\n{dumped}\n---\n{body if body else ''}"
 
-        # Atomic write back
-        target_dir = _os.path.dirname(documentPath) or "."
-        _os.makedirs(target_dir, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=target_dir) as tmp:
+        # Atomic write back using normalized path
+        target_dir = doc_path.parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8", dir=str(target_dir)) as tmp:
             tmp.write(new_content)
             tmp_path = tmp.name
-        _os.replace(tmp_path, documentPath)
+        _os.replace(tmp_path, str(doc_path))
 
         _ms = round((time.perf_counter() - _t0) * 1000, 1)
-        logger.info(f"ensure_yaml_citations: updated {documentPath} using {parser_name} parser in {_ms} ms")
+        logger.info(f"ensure_yaml_citations: updated {doc_path} using {parser_name} parser in {_ms} ms")
         return f"YAML citations updated (parser={parser_name})."
     except Exception as e:  # noqa: BLE001
         logger.exception("ensure_yaml_citations: error")
-        return _format_error("Error ensuring YAML citations", e)
+        hint = ""
+        try:
+            # Provide mapping hint when Windows path is seen on POSIX
+            if os.name != "nt" and _re.match(r"^[A-Za-z]:[\\/]", documentPath or ""):
+                hint = (
+                    "\nHint: Detected Windows path on Linux. Set ZOTERO_HOST_DRIVES_ROOT (e.g., /host_mnt or /mnt) "
+                    "and ensure the host drive is mounted inside the container. "
+                    "You can also set ZOTERO_DOCS_BASE for resolving relative paths."
+                )
+        except Exception:
+            pass
+        return _format_error("Error ensuring YAML citations", Exception(str(e) + hint))
 
 
 # ------------------------
@@ -1877,7 +1977,11 @@ def validate_references(
     import re as _re
 
     try:
-        content = open(documentPath, "r", encoding="utf-8").read()
+        # Normalize paths for cross-platform compatibility
+        doc_path = _normalize_path(documentPath)
+        bib_path = _normalize_path(bibliographyPath)
+        
+        content = open(doc_path, "r", encoding="utf-8").read()
     except Exception as e:  # noqa: BLE001
         return _format_error("Error reading document", e)
 
@@ -1899,7 +2003,7 @@ def validate_references(
             keys.add(p)
 
     try:
-        with open(bibliographyPath, "r", encoding="utf-8") as f:
+        with open(bib_path, "r", encoding="utf-8") as f:
             data = _json.load(f)
         items = data["items"] if isinstance(data, dict) and "items" in data else data
         csl_map: dict[str, dict[str, Any]] = {}
@@ -2020,12 +2124,24 @@ def build_exports(
     _t0 = time.perf_counter()
     out_paths: list[str] = []
     warnings: list[str] = []
-    base = _Path(documentPath)
+    
+    # Normalize all paths for cross-platform compatibility
+    doc_path = _normalize_path(documentPath)
+    base = doc_path
     stem = base.stem
 
     pandoc = shutil.which("pandoc")
     if not pandoc:
-        return "Pandoc is not installed or not in PATH."
+        return "Pandoc is not installed or not in PATH. Install Pandoc (https://pandoc.org/installing.html) and ensure it's in your system PATH."
+
+    # Normalize optional paths if provided
+    if bibliographyPath:
+        bib_path = _normalize_path(bibliographyPath)
+        bibliographyPath = str(bib_path)
+    
+    if cslPath:
+        csl_norm_path = _normalize_path(cslPath)
+        cslPath = str(csl_norm_path)
 
     # Sensible defaults: if no CSL provided, try default from env or fetch LNCS
     if not cslPath:
@@ -2054,7 +2170,7 @@ def build_exports(
 
     for fmt in formats:
         out = str(base.with_suffix("." + ("pdf" if fmt == "pdf" else fmt)))
-        cmd = [pandoc, documentPath, "-o", out]
+        cmd = [pandoc, str(doc_path), "-o", out]
         if useCiteproc:
             cmd.append("--citeproc")
         if bibliographyPath:
