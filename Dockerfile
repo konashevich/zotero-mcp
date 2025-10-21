@@ -3,6 +3,14 @@ FROM python:3.13-slim-bookworm
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
 
+# Install system dependencies needed for builds (pandoc, wkhtmltopdf)
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+	   pandoc \
+	   wkhtmltopdf \
+	   fonts-dejavu \
+	&& rm -rf /var/lib/apt/lists/*
+
 # Install application
 ADD README.md LICENSE pyproject.toml uv.lock src scripts /app/
 WORKDIR /app
@@ -11,6 +19,8 @@ RUN uv sync
 
 # Check basic functionality
 RUN uv run zotero-mcp --help
+RUN pandoc --version || true
+RUN wkhtmltopdf --version || true
 RUN uv run python - <<'PY'
 import sys
 try:

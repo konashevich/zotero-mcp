@@ -14,13 +14,48 @@ from zotero_mcp import export_bibliography_content, ensure_style_content, ensure
 
 def test_export_bibliography_csljson(tmp_path: Path, mock_zotero: MagicMock) -> None:
     mock_zotero.everything.side_effect = lambda x: x  # passthrough
-    mock_zotero.items.return_value = [{"id": 1}, {"id": 2}]
+    # Return native Zotero items (so code exercises local CSL mapping)
+    mock_zotero.items.return_value = [
+        {"key": "K1", "data": {"key": "K1", "itemType": "journalArticle", "title": "A", "creators": []}},
+        {"key": "K2", "data": {"key": "K2", "itemType": "journalArticle", "title": "B", "creators": []}},
+    ]
 
     out = export_bibliography_content(format="csljson", scope="library", fetchAll=False)
     assert "# Bibliography export (content)" in out
     assert "SHA256:" in out
     assert "Items: 2" in out
     assert "result" in out
+    # Extract and verify CSL JSON shape
+    import json, re
+    m = re.search(r"```json\n(.*?)\n```", out, flags=re.DOTALL)
+    assert m
+    payload = json.loads(m.group(1))
+    res = payload.get("result", payload)
+    content = res["content"]
+    data = json.loads(content)
+    assert isinstance(data, list)
+    assert all(isinstance(e.get("id"), str) for e in data)
+    # Stable ordering by id then title (K1 before K2)
+    ids = [e.get("id") for e in data]
+    assert ids == sorted(ids)
+
+
+def test_export_bibliography_csljson_already_csl_list(tmp_path: Path, mock_zotero: MagicMock) -> None:
+    # Upstream returns a Python list in CSL shape
+    mock_zotero.items.return_value = [
+        {"id": "a", "title": "A"},
+        {"id": "b", "title": "B"},
+    ]
+    out = export_bibliography_content(format="csljson", scope="library", fetchAll=False)
+    import json, re
+    m = re.search(r"```json\n(.*?)\n```", out, flags=re.DOTALL)
+    assert m, "Expected JSON result block"
+    payload = json.loads(m.group(1))
+    res = payload.get("result", payload)
+    content = res["content"]
+    data = json.loads(content)
+    assert isinstance(data, list) and len(data) == 2
+    assert all(isinstance(e.get("id"), str) for e in data)
 
 
 def test_export_bibliography_collection(tmp_path: Path, mock_zotero: MagicMock) -> None:

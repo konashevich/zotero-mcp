@@ -99,10 +99,10 @@ Notes:
     - Tests: Markdown fixtures with edge cases (code blocks, escaped @, YAML blocks).
 
 1. Tool: exports.build
-    - Behavior: Produce DOCX/HTML/PDF with resolved citations using Pandoc `--citeproc`; default PDF via headless Edge; optional xelatex when configured.
-    - Impl: Subprocess to `pandoc`; environment flags for paths; collect logs; return output paths and warnings.
-    - Acceptance: Given a minimal Markdown + references/style, returns valid outputs; graceful errors when Pandoc or engines are missing.
-    - Tests: Mark as integration/optional; smoke test if Pandoc present; unit test command construction otherwise.
+   - Behavior: Produce DOCX/HTML/PDF with resolved citations using Pandoc `--citeproc`; default PDF via wkhtmltopdf; xelatex optional when installed.
+   - Impl: Subprocess to `pandoc`; environment flags for paths; collect logs; return output paths and warnings.
+   - Acceptance: Given a minimal Markdown + references/style, returns valid outputs; graceful errors when Pandoc or engines are missing.
+   - Tests: Mark as integration/optional; smoke test if Pandoc present; unit test command construction otherwise.
 
 ### Phase 6 — Caching, limits, polish
 
@@ -143,7 +143,7 @@ Notes:
 
 - Better BibTeX endpoint variability: Detect capability and fail with guidance; keep on‑demand export as fallback.
 - Citekey source of truth: Prefer BBT; otherwise parse exported bib/CSL JSON; document precedence.
-- Platform PDF engine differences: Default to Edge headless; make LaTeX optional and explicitly configured.
+- Platform PDF engine differences: Default to wkhtmltopdf; make LaTeX (xelatex) optional and explicitly configured.
 - Rate limits and library locks: Respect `Retry‑After`; surface friendly messages (existing `_format_error`).
 
 ## Next steps (immediate)

@@ -59,18 +59,18 @@ Strict policy: No backward compatibility. Replace path-based tools with content-
 4. zotero_build_exports_content (hybrid)
 
    - Input:
-     - documentContent: string
-     - formats: ("docx"|"html"|"pdf")[]
-     - bibliographyContent?: string (CSL JSON)
-     - cslContent?: string
-     - useCiteproc?: boolean (default true)
-     - pdfEngine?: "edge" | "xelatex" (default edge)
+      - documentContent: string
+      - formats: ("docx"|"html"|"pdf")[]
+      - bibliographyContent?: string (CSL JSON)
+      - cslContent?: string
+      - useCiteproc?: boolean (default true)
+      - pdfEngine?: "wkhtmltopdf" | "xelatex" (default wkhtmltopdf)
 
    - Output:
-     - artifacts: { format: string, path?: string, dataURI?: string, warnings?: string[] }[]
+      - artifacts: { format: string, path?: string, dataURI?: string, warnings?: string[] }[]
 
    - Notes:
-     - If filesystem is required by Pandoc, write to temp files server-side and return artifacts as data URIs or server-native paths (configurable). Paths are server-native; no cross-OS mapping.
+      - If filesystem is required by Pandoc, write to temp files server-side and return artifacts as data URIs or server-native paths (configurable). Paths are server-native; no cross-OS mapping.
 
 ## Tools to deprecate (remove)
 

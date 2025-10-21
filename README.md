@@ -27,8 +27,8 @@ This MCP server provides the following tools. Strict policy: no backward compati
 
 ### Export & Bibliography Tools
 
-- `zotero_export_collection`: Export items in a collection to formats like RIS, BibTeX, CSL JSON, CSV, or styled bibliography/citations
-- `zotero_export_bibliography_content`: Export library or collection bibliography as content with SHA-256 hash verification
+- `zotero_export_collection`: Export items in a collection to formats like RIS, BibTeX, CSL JSON, CSV, or styled bibliography/citations. For text formats (e.g., RIS/CSV), outputs are normalized as plain text. For CSL JSON, the tool validates shape; warnings/codes are included when upstream responses are not citeproc-ready.
+- `zotero_export_bibliography_content`: Export library or collection bibliography as content with SHA-256 hash verification. For `format=csljson`, the tool ensures citeproc-ready CSL JSON. If upstream returns non-CSL JSON, it falls back to a minimal mapping (ids may be Zotero keys) and includes warnings/diagnostic codes.
 - `zotero_ensure_style_content`: Retrieve CSL style content by ID or URL with metadata
 - `zotero_ensure_yaml_citations_content`: Ensure Markdown YAML front matter contains citation fields; accepts document content and optional bibliography/style content; returns updated content and diagnostics
 
@@ -48,7 +48,64 @@ This MCP server provides the following tools. Strict policy: no backward compati
 ### Validation & Build Tools
 
 - `zotero_validate_references_content`: Validate Markdown citekeys against a CSL JSON bibliography string; returns unresolved, duplicates, missing fields, suggestions
-- `zotero_build_exports_content`: Build DOCX/HTML/PDF from Markdown content using Pandoc. Optionally embed outputs as data URIs using `EXPORTS_EMBED_DATA_URI=true`.
+- `zotero_build_exports_content`: Build DOCX/PDF from Markdown content using Pandoc. Each artifact is returned inline with `{format, filename, content(base64), size}` so clients can write files locally without touching the server filesystem.
+
+#### Environment knobs (build/export)
+
+- PANDOC_PATH: Absolute path to pandoc (else auto-detected with which).
+- PDF_ENGINE: Preferred PDF engine name (`wkhtmltopdf`|`weasyprint`|`xelatex`). If set, the tool tries this first.
+- PDF_ENGINE_PATH: Absolute path to the engine binary; when set, its directory is prepended to PATH for the pandoc call.
+- OUTPUT_BASENAME (tool param): Override the output stem without relying on front matter or headings.
+  
+Exporter behavior notes:
+
+- CSL JSON readiness: `export_bibliography_content` and `export_collection(format=csljson)` validate the JSON shape (array or `{items:[]}`) and ensure entries have an `id`. When upstream content is not CSL-ready, the server adds warnings and `codes` (e.g., `INVALID_CSL_EXPORT`, `CSL_IDS_FROM_ZOTERO_KEYS`).
+- Text formats: `export_collection(format=ris|csv|...)` emits plain text (no JSON parsing). RIS counts are estimated by the number of `TY -` lines.
+- Styled citations: `export_collection(format=citation, style=...)` concatenates strings from `data.citation`. If Zotero doesn’t include them, the tool returns `EMPTY_CITATION_EXPORT` in warnings/codes.
+
+#### Health diagnostics
+
+The `zotero_health` tool reports:
+
+- YAML: pyyaml availability and selected parser
+- Pandoc: detected path and version (or actionable error when missing)
+- PDF: selected engine name and `pdfEngineVersion`
+- Export status: whether base64 delivery is active and the detected output basename strategy
+
+#### Client-build fallback (when pandoc is missing)
+
+If pandoc isn’t found on the server, `zotero_build_exports_content` returns a JSON “clientBuild kit” that includes per-format commands and one-line strings. Filenames are derived from the document title or the explicit `outputBasename` so you can save outputs with meaningful names. PDF commands default to `--pdf-engine=wkhtmltopdf`, and any `extraArgs` are propagated.
+
+#### CLI helper (local file writes)
+
+`scripts/build_exports.py` wraps the content-first tool but saves artifacts locally on your machine:
+
+- It decodes the base64 `content` payload the tool returns and writes files using the provided `filename`.
+- Flags: `--out-dir` (defaults to `.`) and `--output-basename` (force a specific filename stem); `--pdf-engine` selects among `wkhtmltopdf`, `weasyprint`, or `xelatex`.
+
+#### Example client decoding snippet
+
+```python
+import base64
+from pathlib import Path
+
+result = mcp.call_tool(
+    "zotero_build_exports_content",
+    {
+        "documentContent": markdown_text,
+        "formats": ["docx", "pdf"],
+    },
+)
+
+for artifact in result["artifacts"]:
+    data = base64.b64decode(artifact["content"])
+    Path(artifact["filename"]).write_bytes(data)
+```
+
+#### Export troubleshooting
+
+- **Pandoc missing**: Install pandoc or set `PANDOC_PATH` to the binary; the tool falls back to a client-build kit when it cannot find pandoc.
+- **No PDF engine**: Install `wkhtmltopdf`, `weasyprint`, or `xelatex`, or set `PDF_ENGINE_PATH` to the binary. The startup logs and `zotero_health` output report which engine (if any) is detected.
 
 ### Convenience Tools
 
@@ -168,9 +225,9 @@ For manual steps, see `.github/instructions/deploy.instructions.md`.
   - Scan Markdown for citekeys and validate against CSL JSON content
   - Returns unresolved keys, duplicates, duplicate citations, missing fields `{id, missing}`, suggestions `{}` and unused entries
 
-- `zotero_build_exports_content(documentContent, formats=["docx","html","pdf"], bibliographyContent?, cslContent?, useCiteproc=true, pdfEngine="edge"|"xelatex", extraArgs?)`
+- `zotero_build_exports_content(documentContent, formats=["docx","pdf"], outputBasename?, bibliographyContent?, cslContent?, useCiteproc=true, pdfEngine="wkhtmltopdf"|"weasyprint"|"xelatex", extraArgs?)`
   - Build outputs with Pandoc and citation processing
-  - By default returns server-native paths. Set `EXPORTS_EMBED_DATA_URI=true` to embed artifact bytes in `dataURI` fields instead.
+  - Returns base64-encoded artifacts so the client can write files locally. Each artifact includes `format`, `filename`, `content`, and `size`.
 
 ## Examples (content-first tools)
 
@@ -229,7 +286,7 @@ Result fields
 - `missingFields`: list of `{id, missing}`
 - `duplicateCitations` and `unusedEntries`: provided for convenience
 
-### Build exports (DOCX/HTML/PDF)
+### Build exports (DOCX/PDF)
 
 Tool: `zotero_build_exports_content`
 
@@ -238,15 +295,14 @@ Input
 ```json
 {
   "documentContent": "# Title\n\nHello\n",
-  "formats": ["docx","html"],
+  "formats": ["docx","pdf"],
   "useCiteproc": true
 }
 ```
 
 Behavior
 
-- Writes temp files internally for Pandoc.
-- Set env `EXPORTS_EMBED_DATA_URI=true` to receive `{dataURI}` instead of `{path}` in artifacts.
+- Writes temp files internally for Pandoc, then returns base64-encoded artifacts with filenames derived from the document title or the explicit `outputBasename`.
 
 Result (excerpt)
 
@@ -254,8 +310,8 @@ Result (excerpt)
 {
   "result": {
     "artifacts": [
-      {"format": "docx", "path": "/tmp/.../out.docx"},
-      {"format": "html", "path": "/tmp/.../out.html"}
+      {"format": "docx", "filename": "Title.docx", "content": "UEsDBBQABA...", "size": 1234},
+      {"format": "pdf", "filename": "Title.pdf", "content": "JVBERi0xLjQKJ...", "size": 5678}
     ],
     "warnings": []
   }

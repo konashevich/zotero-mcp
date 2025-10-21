@@ -69,4 +69,4 @@ build-docs:
 	@echo "Example: uv run python scripts/build_exports.py -d paper.md -f docx,pdf -b refs.json -c .styles/lncs.csl"
 
 build-pdf:
-	uv run python scripts/build_exports.py -d paper.md -f pdf -b refs.json -c .styles/lncs.csl --pdf-engine edge
+	uv run python scripts/build_exports.py -d paper.md -f pdf -b refs.json -c .styles/lncs.csl --pdf-engine wkhtmltopdf

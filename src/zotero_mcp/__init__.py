@@ -8,6 +8,7 @@ import re as _re
 from typing import Any, Literal, Iterable, Mapping, TypedDict, Optional
 import time
 import logging
+from dataclasses import dataclass
 try:
     import bibtexparser
 except Exception:  # noqa: BLE001
@@ -245,6 +246,35 @@ def zotero_health() -> str:
     info["cacheMax"] = _os.getenv("ZOTERO_CACHE_MAX", "(default)")
     info["rateMinInterval"] = _os.getenv("ZOTERO_RATE_MIN_INTERVAL", "(default)")
     info["logLevel"] = logging.getLevelName(logger.level)
+    # Pandoc / PDF engine diagnostics
+    try:
+        explicit_pandoc = os.getenv("PANDOC_PATH")
+        if explicit_pandoc:
+            info["pandoc"] = explicit_pandoc if Path(explicit_pandoc).exists() else f"missing:{explicit_pandoc}"
+        else:
+            found = shutil.which("pandoc")
+            info["pandoc"] = found or "missing"
+        pandoc_path = info["pandoc"]
+        if isinstance(pandoc_path, str) and not pandoc_path.startswith("missing"):
+            r = subprocess.run([pandoc_path, "--version"], capture_output=True, text=True)
+            info["pandocVersion"] = r.stdout.splitlines()[0] if r.returncode == 0 and r.stdout else "unknown"
+    except Exception:  # noqa: BLE001
+        info["pandoc"] = "error"
+    # PDF engine detection (non-browser only)
+    engine, engine_warnings = _detect_pdf_engine(os.getenv("PDF_ENGINE"))
+    info["pdfEngine"] = engine or "missing"
+    if engine:
+        try:
+            er = subprocess.run([engine, "--version"], capture_output=True, text=True)
+            if er.returncode == 0 and er.stdout:
+                info["pdfEngineVersion"] = er.stdout.splitlines()[0]
+        except Exception:  # noqa: BLE001
+            pass
+    if engine_warnings:
+        info["pdfEngineWarnings"] = engine_warnings
+    # Export behavior flags
+    info["artifactDelivery"] = "inline-base64"
+    info["basenameStrategy"] = "title/front-matter -> heading -> document (override via outputBasename)"
     info["now"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     info["latencyMs"] = round((time.perf_counter() - _t0) * 1000, 1)
     # output compact JSON for machine-readability
@@ -709,6 +739,279 @@ def _compact_json_block(label: str, obj: dict[str, Any]) -> str:
         return ""
 
 
+def _as_text(obj: Any) -> str:
+    """Normalize various upstream response types to a UTF-8 text string.
+
+    - bytes/bytearray → decode utf-8 with replace
+    - list[str] → join with double newlines
+    - other → str(obj)
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, list) and all(isinstance(x, str) for x in obj):
+        return "\n\n".join(obj)
+    try:
+        return str(obj)
+    except Exception:
+        return ""
+
+
+class _DependencyError(RuntimeError):
+    """Raised when a required external dependency is unavailable."""
+
+
+def _sanitize_basename(candidate: str) -> str:
+    cleaned = _re.sub(r"[^A-Za-z0-9._-]+", "_", (candidate or "").strip())
+    cleaned = cleaned.strip("._-") or "document"
+    return cleaned[:120]
+
+
+def _derive_output_basename(document: str | None, provided: str | None) -> str:
+    if provided and provided.strip():
+        return _sanitize_basename(provided)
+
+    text = (document or "").lstrip("\ufeff")
+    front_match = _re.match(r"^---\s*\n(.*?)\n---\s*\n", text, flags=_re.DOTALL)
+    if front_match:
+        title_match = _re.search(r"^title:\s*['\"]?([^'\"\n]+)", front_match.group(1), flags=_re.MULTILINE)
+        if title_match:
+            return _sanitize_basename(title_match.group(1))
+
+    heading_match = _re.search(r"^#\s+([^\n]+)", text, flags=_re.MULTILINE)
+    if heading_match:
+        return _sanitize_basename(heading_match.group(1))
+
+    return "document"
+
+
+def _ensure_pandoc() -> str:
+    explicit = os.getenv("PANDOC_PATH")
+    if explicit:
+        exp_path = Path(explicit)
+        if exp_path.exists():
+            return str(exp_path)
+        raise _DependencyError(f"PANDOC_PATH points to {explicit}, but the file does not exist.")
+
+    found = shutil.which("pandoc")
+    if found:
+        return found
+    raise _DependencyError(
+        "Pandoc not found on server. Install pandoc or set PANDOC_PATH to its location."
+    )
+
+
+def _detect_pdf_engine(
+    requested: Literal["wkhtmltopdf", "weasyprint", "xelatex"] | None,
+) -> tuple[str | None, list[str]]:
+    warnings: list[str] = []
+    env_engine = os.getenv("PDF_ENGINE")
+    env_path = os.getenv("PDF_ENGINE_PATH")
+
+    def _path_supports(name: str) -> bool:
+        if not env_path:
+            return False
+        ep = Path(env_path)
+        if not ep.exists():
+            warnings.append(f"PDF_ENGINE_PATH set to {env_path} but the file does not exist.")
+            return False
+        if env_engine:
+            return env_engine == name
+        return ep.name.lower().startswith(name)
+
+    def _is_available(name: str) -> bool:
+        if _path_supports(name):
+            return True
+        found = shutil.which(name)
+        return found is not None
+
+    candidates = ("wkhtmltopdf", "weasyprint", "xelatex")
+
+    if env_engine in candidates and _is_available(env_engine):
+        return env_engine, warnings
+
+    if requested in candidates and _is_available(requested):
+        return requested, warnings
+
+    for candidate in candidates:
+        if _is_available(candidate):
+            return candidate, warnings
+
+    warnings.append("No PDF engine found (wkhtmltopdf/weasyprint/xelatex). Pandoc may fail to produce PDF.")
+    return None, warnings
+
+
+@dataclass
+class _ExportArtifact:
+    format: Literal["docx", "pdf"]
+    filename: str
+    content: str
+    size: int
+
+    def __post_init__(self) -> None:
+        if self.format not in {"docx", "pdf"}:
+            raise ValueError(f"Unsupported artifact format: {self.format}")
+        if not isinstance(self.filename, str) or not self.filename.strip():
+            raise ValueError("filename must be a non-empty string")
+        if not isinstance(self.content, str) or not self.content:
+            raise ValueError("content must be a non-empty base64 string")
+        if not isinstance(self.size, int) or self.size < 0:
+            raise ValueError("size must be a non-negative integer")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "format": self.format,
+            "filename": self.filename,
+            "content": self.content,
+            "size": self.size,
+        }
+
+
+
+
+def _log_startup_summary() -> None:
+    """Emit a one-time log summary covering export dependencies."""
+    if os.getenv("ZOTERO_SUPPRESS_STARTUP_LOG") == "1":
+        return
+    try:
+        try:
+            pandoc_path = _ensure_pandoc()
+            pandoc_msg = pandoc_path
+        except _DependencyError as exc:
+            pandoc_msg = f"missing ({exc})"
+        engine, engine_warnings = _detect_pdf_engine(os.getenv("PDF_ENGINE"))
+        delivery = "inline-base64"
+        logger.info(
+            "startup exports: pandoc=%s, pdf_engine=%s, delivery=%s",
+            pandoc_msg,
+            engine or "missing",
+            delivery,
+        )
+        for warning in engine_warnings:
+            logger.warning("startup exports warning: %s", warning)
+    except Exception:  # noqa: BLE001
+        logger.debug("startup exports summary failed", exc_info=True)
+
+def _ensure_csl_json(text: str) -> tuple[Any, list[str]]:
+    """Parse text as JSON and validate it looks like CSL JSON.
+
+    Returns (parsed, warnings). Parsed is either a list of entries or a dict with items[].
+    Adds warnings if the shape looks wrong or entries are missing ids.
+    """
+    warnings: list[str] = []
+    try:
+        import json as _json
+
+        parsed: Any = _json.loads(text)
+    except Exception as e:  # noqa: BLE001
+        return [], [f"INVALID_CSL_EXPORT: not JSON parseable ({e})"]
+
+    def _validate_list(lst: list[Any]) -> list[str]:
+        w: list[str] = []
+        # Check id presence on first few items
+        for it in lst[:5]:
+            if not isinstance(it, dict) or not isinstance(it.get("id"), str):
+                w.append("INVALID_CSL_EXPORT: entries missing string 'id' — downstream citeproc may fail")
+                break
+        return w
+
+    if isinstance(parsed, list):
+        warnings.extend(_validate_list(parsed))
+        return parsed, warnings
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        warnings.extend(_validate_list(parsed["items"]))
+        return parsed, warnings
+    return parsed, ["INVALID_CSL_EXPORT: unexpected JSON shape (expected array or object with 'items')"]
+
+
+def _to_csl_entry(item: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort mapping from Zotero native item to a minimal CSL entry."""
+    data = item.get("data", {}) if isinstance(item, dict) else {}
+    entry: dict[str, Any] = {}
+    # id: prefer Better BibTeX-like id if present, else Zotero key
+    entry["id"] = (
+        data.get("citekey")
+        or item.get("key")
+        or data.get("key")
+        or str(item.get("id") or "")
+    )
+    entry["title"] = data.get("title")
+    # authors
+    authors: list[dict[str, Any]] = []
+    for c in data.get("creators", []) or []:
+        if isinstance(c, dict):
+            fam = c.get("lastName") or c.get("family")
+            giv = c.get("firstName") or c.get("given")
+            if fam or giv:
+                a: dict[str, Any] = {}
+                if fam:
+                    a["family"] = fam
+                if giv:
+                    a["given"] = giv
+                authors.append(a)
+    if authors:
+        entry["author"] = authors
+    # issued
+    yr: int | None = None
+    date = data.get("date") or data.get("year")
+    if isinstance(date, str):
+        m = _re.search(r"(19|20)\\d{2}", date)
+        if m:
+            try:
+                yr = int(m.group(0))
+            except Exception:
+                yr = None
+    if yr is not None:
+        entry["issued"] = {"date-parts": [[yr]]}
+    # type (rough mapping)
+    t = data.get("itemType")
+    if t:
+        # minimal, leave as-is; real mapping could be added later
+        entry["type"] = "article-journal" if t == "journalArticle" else t
+    # DOI/URL passthrough
+    if data.get("DOI"):
+        entry["DOI"] = data.get("DOI")
+    if data.get("url"):
+        entry["URL"] = data.get("url")
+    return entry
+
+
+def _normalize_json_input(value: Any, expect: str = "array") -> tuple[str, Any]:
+    """Accept a JSON string or a parsed object and return (json_string, parsed).
+
+    expect: "array" (default) or "object" guides a minimal sanity check.
+    Raises ValueError on irrecoverable input.
+    """
+    import json as _json
+    parsed: Any
+    if value is None:
+        parsed = [] if expect == "array" else {}
+        return _json.dumps(parsed, ensure_ascii=False), parsed
+    if isinstance(value, (dict, list)):
+        parsed = value
+        s = _json.dumps(parsed, ensure_ascii=False)
+        return s, parsed
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8", errors="ignore")
+        except Exception:
+            value = str(value)
+    if isinstance(value, str):
+        s = value
+        try:
+            parsed = _json.loads(s or ("[]" if expect == "array" else "{}"))
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"Invalid JSON: {e}")
+        # basic shape check
+        if expect == "array" and not isinstance(parsed, list) and not (
+            isinstance(parsed, dict) and "items" in parsed
+        ):
+            # allow CSL JSON object with items
+            if not isinstance(parsed, dict):
+                raise ValueError("Expected a JSON array of CSL items or an object with 'items'.")
+        return s, parsed
+    raise ValueError("Unsupported input type. Pass a JSON string or a parsed object.")
+
+
 # ------------------------
 # Library navigation
 # ------------------------
@@ -878,7 +1181,11 @@ def export_bibliography_content(
     limit: int | None = 100,
     fetchAll: bool | None = True,
 ) -> str:
-    """Export bibliography content as a string with metadata (content-first)."""
+    """Export bibliography content as a string with metadata (content-first).
+
+    For csljson: ensure the returned string is citeproc-ready. If the upstream
+    response is not CSL JSON, fall back to a minimal local mapping and warn.
+    """
     import hashlib
     import json as _json
 
@@ -907,12 +1214,108 @@ def export_bibliography_content(
         content_str = ""
         warnings: list[str] = []
         if format == "csljson":
-            try:
-                content_str = _json.dumps(results, ensure_ascii=False)
-                count = len(results) if isinstance(results, list) else 0
-            except Exception:  # noqa: BLE001
-                content_str = str(results)
-                count = len(results) if isinstance(results, list) else 0
+            # There are two cases:
+            # 1) Upstream already returned CSL JSON text/bytes/list
+            # 2) Upstream returned Zotero native items (dicts with data/meta)
+            diag_codes: list[str] = []
+            if isinstance(results, list) and results and isinstance(results[0], dict) and "data" in results[0]:
+                # Native Zotero items — map to minimal CSL
+                mapped = []
+                any_zotero_key_ids = False
+                any_authors_partial = False
+                for it in results:
+                    entry = _to_csl_entry(it)
+                    # Mark when id appears to be an 8-char Zotero key
+                    if isinstance(entry.get("id"), str) and _re.fullmatch(r"[A-Z0-9]{8}", entry["id"] or ""):
+                        any_zotero_key_ids = True
+                    # Detect if creators existed but none mapped to family/given
+                    data = it.get("data", {}) if isinstance(it, dict) else {}
+                    creators = data.get("creators") or []
+                    if creators and not entry.get("author"):
+                        any_authors_partial = True
+                    mapped.append(entry)
+                # stable order by id then title
+                mapped.sort(key=lambda it: (str(it.get("id", "")), str(it.get("title", ""))))
+                content_str = _json.dumps(mapped, ensure_ascii=False)
+                count = len(mapped)
+                # Validate and warn if ids are missing
+                _parsed, w = _ensure_csl_json(content_str)
+                warnings.extend(w)
+                if any_zotero_key_ids:
+                    warnings.append("CSL ids derived from Zotero item keys; Better BibTeX citekeys not available")
+                    diag_codes.append("CSL_IDS_FROM_ZOTERO_KEYS")
+                if any_authors_partial:
+                    warnings.append("Some authors could not be structured (family/given) and were omitted")
+                    diag_codes.append("CSL_AUTHORS_PARTIAL")
+            else:
+                # If results is already a Python list/dict, JSON-encode it; else treat as text
+                if isinstance(results, (list, dict)):
+                    try:
+                        content_str = _json.dumps(results, ensure_ascii=False)
+                    except Exception:
+                        content_str = _as_text(results)
+                else:
+                    content_str = _as_text(results)
+                parsed, w = _ensure_csl_json(content_str)
+                warnings.extend(w)
+                if isinstance(parsed, list):
+                    count = len(parsed)
+                elif isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+                    count = len(parsed["items"])  # type: ignore[index]
+                # If parsed shape looks wrong (e.g. list of strings or missing ids), perform a fallback
+                need_fallback = False
+                if warnings:
+                    # Any INVALID_CSL_EXPORT warning triggers fallback mapping
+                    need_fallback = any("INVALID_CSL_EXPORT" in w for w in warnings)
+                # Additional heuristic: results like ["items", ...] (strings only)
+                if not need_fallback and isinstance(results, list) and all(isinstance(x, str) for x in results):
+                    need_fallback = True
+                if need_fallback:
+                    try:
+                        # Refetch native items without format param and map locally to CSL
+                        zot_fallback = get_zotero_client()
+                        # Do not set format to let API return native item JSON
+                        if scope == "collection":
+                            if not collectionKey:
+                                return "collectionKey is required when scope='collection'"
+                            native = (
+                                zot_fallback.everything(zot_fallback.collection_items(collectionKey)) if fetchAll else zot_fallback.collection_items(collectionKey)
+                            )
+                        else:
+                            native = zot_fallback.everything(zot_fallback.items()) if fetchAll else zot_fallback.items()
+                        if isinstance(native, list) and native and isinstance(native[0], dict) and "data" in native[0]:
+                            mapped = []
+                            any_zotero_key_ids = False
+                            any_authors_partial = False
+                            for it in native:
+                                entry = _to_csl_entry(it)
+                                if isinstance(entry.get("id"), str) and _re.fullmatch(r"[A-Z0-9]{8}", entry["id"] or ""):
+                                    any_zotero_key_ids = True
+                                data = it.get("data", {}) if isinstance(it, dict) else {}
+                                creators = data.get("creators") or []
+                                if creators and not entry.get("author"):
+                                    any_authors_partial = True
+                                mapped.append(entry)
+                            mapped.sort(key=lambda it: (str(it.get("id", "")), str(it.get("title", ""))))
+                            content_str = _json.dumps(mapped, ensure_ascii=False)
+                            count = len(mapped)
+                            # Revalidate mapped content
+                            _parsed2, w2 = _ensure_csl_json(content_str)
+                            warnings.extend(w2)
+                            diag_codes.append("CSL_FALLBACK_LOCAL_MAPPING")
+                            if any_zotero_key_ids:
+                                warnings.append("CSL ids derived from Zotero item keys; Better BibTeX citekeys not available")
+                                diag_codes.append("CSL_IDS_FROM_ZOTERO_KEYS")
+                            if any_authors_partial:
+                                warnings.append("Some authors could not be structured (family/given) and were omitted")
+                                diag_codes.append("CSL_AUTHORS_PARTIAL")
+                    except Exception:
+                        # Keep original content_str and warnings if fallback fails
+                        pass
+            # attach diag codes for csljson branch if any
+            if locals().get("diag_codes"):
+                # Will be included in JSON block below
+                pass
         elif format == "bibtex":
             try:
                 import bibtexparser  # type: ignore
@@ -938,9 +1341,16 @@ def export_bibliography_content(
             f"Items: {count}",
             f"SHA256: {sha}",
         ]
-        return "\n".join(header) + _compact_json_block(
-            "result", {"content": content_str, "count": count, "sha256": sha, "warnings": warnings}
-        )
+        result_obj: dict[str, Any] = {"content": content_str, "count": count, "sha256": sha, "warnings": warnings}
+        if format == "csljson":
+            # include diagnostic codes when present (from mapping and from warnings)
+            dc = list(locals().get("diag_codes") or [])
+            for w in warnings:
+                if "INVALID_CSL_EXPORT" in w and "INVALID_CSL_EXPORT" not in dc:
+                    dc.append("INVALID_CSL_EXPORT")
+            if dc:
+                result_obj["codes"] = dc
+        return "\n".join(header) + _compact_json_block("result", result_obj)
     except Exception as e:  # noqa: BLE001
         return _format_error("Error exporting bibliography", e)
 
@@ -1008,8 +1418,8 @@ def ensure_style_content(style: str) -> str:
 )
 def ensure_yaml_citations_content(
     documentContent: str,
-    bibliographyContent: str | None = None,
-    cslContent: str | None = None,
+    bibliographyContent: Any | None = None,
+    cslContent: Any | None = None,
     linkCitations: bool | None = True,
 ) -> str:
     """Insert or update YAML front matter keys for citations in provided content.
@@ -1208,7 +1618,7 @@ def library_ensure_auto_export(
 )
 def resolve_citekeys(
     citekeys: list[str],
-    bibliographyContent: str | None = None,
+    bibliographyContent: Any | None = None,
     tryZotero: bool | None = True,
     preferBBT: bool | None = True,
 ) -> str:
@@ -1277,9 +1687,9 @@ def resolve_citekeys(
             pass
 
     # From CSL JSON (content-based)
-    if bibliographyContent:
+    if bibliographyContent is not None:
         try:
-            data = _json.loads(bibliographyContent)
+            _s, data = _normalize_json_input(bibliographyContent, expect="array")
             items = data["items"] if isinstance(data, dict) and "items" in data else data
             csl_map: dict[str, dict[str, Any]] = {}
             if isinstance(items, list):
@@ -1309,8 +1719,11 @@ def resolve_citekeys(
                         }
                 else:
                     unresolved.append(ck)
-        except Exception:
-            bibliographyContent = None
+        except Exception as e:
+            return (
+                "Invalid bibliographyContent. Pass CSL JSON as a string or a parsed array/object with 'items'. "
+                f"Details: {e}"
+            )
 
     # Try Zotero for unresolved keys that look like item keys
     looks_like_item_key = _re.compile(r"^[A-Z0-9]{8}$")
@@ -1794,7 +2207,7 @@ def suggest_citations(
 )
 def validate_references_content(
     documentContent: str,
-    bibliographyContent: str,
+    bibliographyContent: Any,
     requireDOIURL: bool | None = True,
 ) -> str:
     """Scan Markdown for citekeys and validate against a CSL JSON bibliography string."""
@@ -1821,14 +2234,18 @@ def validate_references_content(
             keys.add(p)
 
     try:
-        data = _json.loads(bibliographyContent or "{}")
+        # Accept string or parsed object
+        _s, data = _normalize_json_input(bibliographyContent, expect="array")
         items = data["items"] if isinstance(data, dict) and "items" in data else data
         csl_map: dict[str, dict[str, Any]] = {}
         for it in items if isinstance(items, list) else []:
             if isinstance(it, dict) and isinstance(it.get("id"), str):
                 csl_map[it["id"]] = it
     except Exception as e:  # noqa: BLE001
-        return _format_error("Error reading bibliography", e)
+        return (
+            "Invalid bibliographyContent. Pass CSL JSON as a string or a parsed array/object with 'items'. "
+            f"Details: {e}"
+        )
 
     unresolved = [k for k in keys if k not in csl_map]
     duplicate_keys: list[str] = []
@@ -1879,27 +2296,26 @@ def validate_references_content(
 
     # Use resolver chain to get robust resolution (prefer BBT/file/Zotero)
     try:
-        # Best-effort suggestions using existing resolver (bibliographyPath not applicable here)
+        # Best-effort suggestions using existing resolver (bibliographyPath not applicable here).
+        # Do NOT override the unresolved list computed from the provided bibliography.
         resolved_out = resolve_citekeys(list(keys), tryZotero=True, preferBBT=True)
         # Extract JSON result block if present
         import json as _json
 
         m = _re.search(r"```json\n(.*?)\n```", resolved_out, flags=_re.DOTALL)
-        suggestions: dict[str, list[dict[str, Any]]] = {}
-        resolved_map: dict[str, dict[str, Any]] = {}
+        suggestions = {}
         if m:
             parsed = _json.loads(m.group(1))
             res = parsed.get("result", parsed)
-            resolved_map = res.get("resolved", {})
-            unresolved = res.get("unresolved", [])
-        else:
-            resolved_map = {}
-        # Keep suggestions empty; resolver already gives resolved/unresolved
+            _resolved_map = res.get("resolved", {})
+            _ = _resolved_map  # reserved for future suggestion formatting
     except Exception:  # noqa: BLE001
         suggestions = {}
 
-    header = [
-        "# Validation report",
+    header = ["# Validation report"]
+    if len(keys) == 0:
+        header.append("No Pandoc citations found. Keep footnotes or add [@keys] for citeproc.")
+    header += [
         f"Unresolved: {len(unresolved)}",
         f"Duplicate keys: {len(duplicate_keys)}",
         f"Missing fields: {len(missing_fields)}",
@@ -1922,65 +2338,110 @@ def validate_references_content(
 @mcp.tool(
     name="zotero_build_exports_content",
     description=(
-        "Build outputs (docx|html|pdf) from Markdown content using Pandoc with --citeproc. Writes temp files server-side and returns artifacts."
+        "Build DOCX/PDF from Markdown content using Pandoc with --citeproc. Returns base64-encoded artifacts so clients can write locally."
     ),
 )
 def build_exports_content(
     documentContent: str,
-    formats: list[Literal["docx", "html", "pdf"]],
-    bibliographyContent: str | None = None,
-    cslContent: str | None = None,
+    formats: list[Literal["docx", "pdf"]],
+    outputBasename: str | None = None,
+    bibliographyContent: Any | None = None,
+    cslContent: Any | None = None,
     useCiteproc: bool | None = True,
-    pdfEngine: Literal["edge", "xelatex"] | None = "edge",
+    pdfEngine: Literal["wkhtmltopdf", "weasyprint", "xelatex"] | None = None,
     extraArgs: list[str] | None = None,
 ) -> str:
     import tempfile as _tempfile
-    # pandoc
-    if shutil.which("pandoc") is None:
-        return (
-            "Error: pandoc is not in PATH. Install from https://pandoc.org/installing.html "
-            "or ensure it is available on the server."
-        )
-    _t0 = time.perf_counter()
-    # Validate formats
+    import base64 as _base64
+
     if not formats:
-        return "Error: No formats specified. Provide at least one of: docx, html, pdf."
-    supported = {"docx", "html", "pdf"}
+        return "Error: No formats specified. Provide at least one of: docx, pdf."
+    supported = {"docx", "pdf"}
     bad = [f for f in formats if f not in supported]
     if bad:
-        return f"Error: Unsupported formats: {', '.join(bad)}. Supported: docx, html, pdf."
+        return f"Error: Unsupported formats: {', '.join(bad)}. Supported: docx, pdf."
+
+    basename = _derive_output_basename(documentContent, outputBasename)
+
+    try:
+        _pandoc_path = _ensure_pandoc()
+    except _DependencyError as exc:
+        has_bib = bibliographyContent is not None
+        has_csl = cslContent is not None
+        use_cp = True if useCiteproc is None else bool(useCiteproc)
+        cmds: list[list[str]] = []
+        cmds_one_line: list[str] = []
+        for fmt in formats:
+            out_name = f"{basename}.{fmt}"
+            base = ["pandoc", "doc.md"]
+            if use_cp:
+                base += ["--citeproc"]
+            if has_bib:
+                base += ["--bibliography", "refs.json"]
+            if has_csl:
+                base += ["--csl", "style.csl"]
+            if fmt == "pdf":
+                base += ["--pdf-engine=wkhtmltopdf"]
+            if extraArgs:
+                base += list(extraArgs)
+            base += ["-o", out_name]
+            cmds.append(base)
+            cmds_one_line.append(" ".join(base))
+        kit = {
+            "message": str(exc),
+            "steps": [
+                "1) Save your Markdown to doc.md (UTF-8)",
+                "2) If you have a CSL JSON bibliography, save it to refs.json",
+                "3) If you have a CSL style, save it to style.csl",
+                "4) Run the command(s) below for each requested format:",
+            ],
+            "commands": cmds,
+            "commandsOneLine": cmds_one_line,
+            "notes": [
+                "PDF requires wkhtmltopdf, weasyprint, or xelatex installed; the commands default to wkhtmltopdf.",
+                "Set PDF_ENGINE and PDF_ENGINE_PATH to choose a different engine if desired.",
+                "CSL JSON must be an array of items or an object with an 'items' array. Example: [{\"id\":\"k1\",\"title\":\"T\"}].",
+            ],
+        }
+        return f"Error: {exc}" + _compact_json_block("clientBuild", kit)
+
+    _t0 = time.perf_counter()
     out_artifacts: list[dict[str, Any]] = []
     warnings: list[str] = []
     tempdir = _tempfile.mkdtemp(prefix="zot-export-")
     try:
-        # Write temp inputs
         doc_path = Path(tempdir) / "doc.md"
         doc_path.write_text((documentContent or "").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n"), encoding="utf-8")
         bib_path = None
         if bibliographyContent is not None:
+            try:
+                bib_str, _ = _normalize_json_input(bibliographyContent, expect="array")
+            except Exception as e:  # noqa: BLE001
+                return f"Invalid bibliographyContent: {e}"
             bib_path = Path(tempdir) / "refs.json"
-            bib_path.write_text(bibliographyContent, encoding="utf-8")
+            bib_path.write_text(bib_str, encoding="utf-8")
         csl_path = None
         if cslContent is not None:
             csl_path = Path(tempdir) / "style.csl"
             csl_path.write_text(cslContent, encoding="utf-8")
 
-        # Build format by format
+        chosen_engine_for_log: str | None = None
         for fmt in formats:
-            out_file = str(Path(tempdir) / f"out.{fmt}")
+            out_file = Path(tempdir) / f"{basename}.{fmt}"
             cmd = [
-                "pandoc",
+                _pandoc_path,
                 str(doc_path),
                 "-o",
-                out_file,
+                str(out_file),
             ]
             if useCiteproc:
                 cmd.append("--citeproc")
             if fmt == "pdf":
-                if pdfEngine == "edge" and shutil.which("msedge"):
-                    cmd += ["--pdf-engine=msedge"]
-                elif pdfEngine == "xelatex":
-                    cmd += ["--pdf-engine=xelatex"]
+                chosen_engine, engine_warnings = _detect_pdf_engine(pdfEngine)
+                warnings.extend(engine_warnings)
+                if chosen_engine:
+                    cmd += [f"--pdf-engine={chosen_engine}"]
+                    chosen_engine_for_log = chosen_engine
             if bib_path:
                 cmd += ["--bibliography", str(bib_path)]
             if csl_path:
@@ -1989,42 +2450,59 @@ def build_exports_content(
                 cmd += list(extraArgs)
 
             logger.info(f"pandoc: {' '.join(cmd)}")
-            r = subprocess.run(cmd, capture_output=True, text=True)
+            run_env = os.environ.copy()
+            pdf_engine_path_env = os.getenv("PDF_ENGINE_PATH")
+            if pdf_engine_path_env:
+                ep = Path(pdf_engine_path_env)
+                if ep.exists():
+                    run_env["PATH"] = str(ep.parent) + os.pathsep + run_env.get("PATH", "")
+            r = subprocess.run(cmd, capture_output=True, text=True, env=run_env)
             if r.returncode != 0:
                 warnings.append(r.stderr.strip())
-            # Optionally embed as data URI
-            embed = os.getenv("EXPORTS_EMBED_DATA_URI", "false").lower() in {"1", "true", "yes"}
-            art: dict[str, Any] = {"format": fmt}
-            if embed:
-                try:
-                    import base64 as _b64
-                    data = Path(out_file).read_bytes()
-                    b64 = _b64.b64encode(data).decode("ascii")
-                    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document" if fmt == "docx" else (
-                        "text/html" if fmt == "html" else "application/pdf"
-                    )
-                    art["dataURI"] = f"data:{mime};base64,{b64}"
-                except Exception as e:  # noqa: BLE001
-                    warnings.append(f"embed dataURI failed: {e}")
-                    art["path"] = out_file
-            else:
-                art["path"] = out_file
-            out_artifacts.append(art)
+                continue
+            try:
+                data = out_file.read_bytes()
+            except FileNotFoundError:
+                warnings.append(f"artifact {fmt} missing at {out_file}")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"artifact {fmt} read failed: {exc}")
+                continue
+            b64 = _base64.b64encode(data).decode("ascii")
+            try:
+                artifact = _ExportArtifact(
+                    format=fmt,
+                    filename=f"{basename}.{fmt}",
+                    content=b64,
+                    size=len(data),
+                )
+                out_artifacts.append(artifact.as_dict())
+            except ValueError as exc:
+                warnings.append(f"artifact {fmt} validation failed: {exc}")
     finally:
-        # Keep tempdir; artifacts live there. A follow-up tool could retrieve or clean them.
-        pass
+        shutil.rmtree(tempdir, ignore_errors=True)
     _ms = round((time.perf_counter() - _t0) * 1000, 1)
-    # Keep duration in logs only to preserve deterministic output
     logger.info(f"build_exports_content: built {formats} in {_ms} ms")
     header = [
         "# Build exports",
         f"Formats: {', '.join(formats)}",
+        f"Basename: {basename}",
     ]
+    chosen_engine_version = None
+    try:
+        if chosen_engine_for_log and shutil.which(chosen_engine_for_log):
+            ev = subprocess.run([chosen_engine_for_log, "--version"], capture_output=True, text=True)
+            if ev.returncode == 0 and ev.stdout:
+                chosen_engine_version = ev.stdout.splitlines()[0]
+    except Exception:
+        pass
     return "\n".join(header) + _compact_json_block(
         "result",
         {
             "artifacts": out_artifacts,
             "warnings": warnings,
+            "chosenEngine": chosen_engine_for_log,
+            "chosenEngineVersion": chosen_engine_version,
         },
     )
 
@@ -2336,6 +2814,7 @@ def export_collection(
     For 'bib'/'citation', a CSL style is recommended.
     """
     zot = get_zotero_client()
+    import json as _json
 
     # Configure parameters based on mode
     try:
@@ -2383,16 +2862,61 @@ def export_collection(
 
         count = 0
         content_str = ""
+        warnings: list[str] = []
         # Normalize output by format
         if format == "csljson":
-            try:
-                import json as _json
-
-                content_str = _json.dumps(results, ensure_ascii=False)
-                count = len(results)
-            except Exception:  # noqa: BLE001
-                content_str = str(results)
-                count = len(results) if isinstance(results, list) else 0
+            # Treat upstream as text and validate CSL JSON
+            extra_codes: list[str] = []
+            if isinstance(results, (list, dict)):
+                # JSON-encode Python objects for consistent shape
+                try:
+                    text = _json.dumps(results, ensure_ascii=False)
+                except Exception:
+                    text = _as_text(results)
+            else:
+                text = _as_text(results)
+            parsed, w = _ensure_csl_json(text)
+            warnings.extend(w)
+            if isinstance(parsed, list):
+                count = len(parsed)
+            elif isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+                count = len(parsed["items"])  # type: ignore[index]
+            content_str = text
+            # Fallback: if invalid or non-citeproc-ready, refetch native items and map locally
+            need_fallback = any("INVALID_CSL_EXPORT" in ww for ww in warnings)
+            if not need_fallback and isinstance(results, list) and all(isinstance(x, str) for x in results):
+                need_fallback = True
+            if need_fallback:
+                try:
+                    zot_fb = get_zotero_client()
+                    native = zot_fb.everything(zot_fb.collection_items(collectionKey)) if fetchAll else zot_fb.collection_items(collectionKey)
+                    if isinstance(native, list) and native and isinstance(native[0], dict) and "data" in native[0]:
+                        mapped = []
+                        any_zotero_key_ids = False
+                        any_authors_partial = False
+                        for it in native:
+                            entry = _to_csl_entry(it)
+                            if isinstance(entry.get("id"), str) and _re.fullmatch(r"[A-Z0-9]{8}", entry["id"] or ""):
+                                any_zotero_key_ids = True
+                            data = it.get("data", {}) if isinstance(it, dict) else {}
+                            creators = data.get("creators") or []
+                            if creators and not entry.get("author"):
+                                any_authors_partial = True
+                            mapped.append(entry)
+                        mapped.sort(key=lambda it: (str(it.get("id", "")), str(it.get("title", ""))))
+                        content_str = _json.dumps(mapped, ensure_ascii=False)
+                        count = len(mapped)
+                        _parsed2, w2 = _ensure_csl_json(content_str)
+                        warnings.extend(w2)
+                        extra_codes.append("CSL_FALLBACK_LOCAL_MAPPING")
+                        if any_zotero_key_ids:
+                            warnings.append("CSL ids derived from Zotero item keys; Better BibTeX citekeys not available")
+                            extra_codes.append("CSL_IDS_FROM_ZOTERO_KEYS")
+                        if any_authors_partial:
+                            warnings.append("Some authors could not be structured (family/given) and were omitted")
+                            extra_codes.append("CSL_AUTHORS_PARTIAL")
+                except Exception:
+                    pass
         elif format == "bibtex":
             # pyzotero returns a bibtexparser database object
             try:
@@ -2408,13 +2932,18 @@ def export_collection(
                 content_str = str(results)
                 count = 0
         elif format in export_formats:
-            # Expect a list of strings
-            if isinstance(results, list):
+            # Treat as text (RIS/CSV/etc.) — do not JSON-parse
+            content_str = _as_text(results)
+            # Better RIS count heuristic: count TY - lines
+            if format == "ris":
+                import re as _re2
+                count = len(_re2.findall(r"(?m)^TY\s*-", content_str))
+                # Warn that count is heuristic
+                warnings.append("COUNT_HEURISTIC: RIS entry count estimated by 'TY -' lines")
+            elif isinstance(results, list):
                 count = len(results)
-                content_str = "\n\n".join(str(r) for r in results)
             else:
-                content_str = str(results)
-                count = 0
+                count = 1 if content_str.strip() else 0
         else:
             # bib/citation included in JSON data per item
             if isinstance(results, list):
@@ -2431,6 +2960,10 @@ def export_collection(
                     except Exception:  # noqa: BLE001
                         pass
                 content_str = "\n\n".join(parts)
+                if count > 0 and not content_str.strip():
+                    warnings.append(
+                        "EMPTY_CITATION_EXPORT: Zotero did not include formatted strings; check style or API parameters"
+                    )
             else:
                 content_str = str(results)
                 count = 0
@@ -2443,21 +2976,39 @@ def export_collection(
         ]
 
         # Build compact JSON summary
-        summary_block = _compact_json_block(
-            "result",
-            {
-                "collectionKey": collectionKey,
-                "format": format,
-                "style": style,
-                "count": count,
-                "limit": limit,
-                "start": start,
-                "all": bool(fetchAll),
-            },
-        )
+        # Attach diagnostic codes for known conditions
+        codes: list[str] = []
+        extra_codes = locals().get("extra_codes", []) or []
+        for w in list(warnings):
+            if "INVALID_CSL_EXPORT" in w:
+                codes.append("INVALID_CSL_EXPORT")
+            if "EMPTY_CITATION_EXPORT" in w:
+                codes.append("EMPTY_CITATION_EXPORT")
+            if "COUNT_HEURISTIC" in w:
+                codes.append("COUNT_HEURISTIC")
+        # Merge any additional diagnostic codes computed during processing
+        try:
+            for c in extra_codes:
+                if c not in codes:
+                    codes.append(c)
+        except Exception:
+            pass
+        summary_block = _compact_json_block("result", {
+            "collectionKey": collectionKey,
+            "format": format,
+            "style": style,
+            "count": count,
+            "limit": limit,
+            "start": start,
+            "all": bool(fetchAll),
+            "warnings": warnings,
+            "codes": codes,
+        })
 
         # Include exported content in a fenced block (avoid JSON fence for non-JSON)
         content_block = f"\n\n### Exported content\n```\n{content_str}\n```"
         return "\n".join(header) + summary_block + content_block
     except Exception as e:  # noqa: BLE001
         return _format_error("Error exporting collection", e)
+
+_log_startup_summary()

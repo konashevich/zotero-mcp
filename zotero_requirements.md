@@ -20,7 +20,7 @@ Enable the agent to use Zotero as a first‑class source of truth for citations 
   - Cloud adaptor: communicates with Zotero Web API using an API key
 - Export pipeline:
   - Pandoc + citeproc for DOCX/HTML
-  - HTML → PDF via headless Edge on Windows (default, stable)
+  - HTML → PDF via wkhtmltopdf by default (Linux-first)
   - Optional: LaTeX (xelatex) path when a TeX toolchain is confirmed stable
 - Workspace glue:
   - Bibliography file in repo (e.g., `references.bib` or `references.json`)
@@ -79,7 +79,7 @@ All tools return structured JSON with `success`, `data`, and `diagnostics`.
 ### Exports
 
 - exports.build
-  - Input: document path; formats (docx|html|pdf); useCiteproc (bool); pdfEngine ("edge"|"xelatex"); extra args
+  - Input: document path; formats (docx|html|pdf); useCiteproc (bool); pdfEngine ("wkhtmltopdf"|"xelatex"); extra args
   - Output: output file paths, logs, warnings
 
 ## Data contracts (summaries)
@@ -106,7 +106,7 @@ All tools return structured JSON with `success`, `data`, and `diagnostics`.
 ### 4. Build outputs
 
 - DOCX/HTML via Pandoc + `--citeproc`
-- PDF via Edge (default) or xelatex (optional)
+- PDF via wkhtmltopdf (default) or xelatex (optional)
 
 ### 5. Open items
 
@@ -165,7 +165,7 @@ Gaps (relative to the target capability set)
 
 ### Gap 5: Build orchestration
 
-- Missing: `exports.build` to run Pandoc (DOCX/HTML) and Edge‑based PDF in one step
+- Missing: `exports.build` to run Pandoc (DOCX/HTML) and wkhtmltopdf‑based PDF in one step
 
 ### Gap 6: Convenience
 
@@ -196,7 +196,7 @@ Phase 3 — Authoring helpers (productivity)
 Phase 4 — Validation and builds
 
 - Implement `writing.validateReferences` (scan Markdown; report unresolved/duplicates/missing fields)
-- Implement `exports.build` (DOCX/HTML via Pandoc + citeproc; PDF via Edge by default; xelatex optional)
+- Implement `exports.build` (DOCX/HTML via Pandoc + citeproc; PDF via wkhtmltopdf by default; xelatex optional)
 
 Phase 5 — Conveniences and polish
 
@@ -239,7 +239,7 @@ ValidationReport (abridged)
 
 ## Notes on Windows specifics
 
-- Default PDF engine should be Edge headless (reliable, no LaTeX required)
+- Default PDF engine should be wkhtmltopdf (reliable, no LaTeX required)
 - If LaTeX is enabled, prefer explicit xelatex path configuration or verified PATH injection
 - Be robust to OneDrive sync by avoiding long‑running file locks and using atomic writes for exported files
 

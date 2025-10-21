@@ -70,6 +70,53 @@ def test_build_exports_content_pdf_engine_flag() -> None:
             assert "Build exports" in out
 
 
+def test_build_exports_content_env_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Force env engine overrides
+    monkeypatch.setenv("PDF_ENGINE", "wkhtmltopdf")
+    with patch("zotero_mcp.__init__.shutil.which") as mock_which:
+        def which(name: str):
+            if name == "pandoc":
+                return "/usr/bin/pandoc"
+            if name == "wkhtmltopdf":
+                return "/usr/bin/wkhtmltopdf"
+            return None
+
+        mock_which.side_effect = which
+        with patch("zotero_mcp.__init__.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stderr = ""
+            out = build_exports_content("# T\n\nB", ["pdf"], useCiteproc=False)
+            assert "Build exports" in out
+
+
+def test_build_exports_content_weasyprint(monkeypatch: pytest.MonkeyPatch) -> None:
+    with patch("zotero_mcp.__init__.shutil.which") as mock_which:
+        def which(name: str):
+            if name == "pandoc":
+                return "/usr/bin/pandoc"
+            if name == "weasyprint":
+                return "/usr/bin/weasyprint"
+            return None
+
+        mock_which.side_effect = which
+        captured: list[list[str]] = []
+
+        class _Res:
+            returncode = 0
+            stderr = ""
+            stdout = "weasyprint 60.0"
+
+        def _fake_run(cmd: list[str], capture_output: bool, text: bool, env: dict[str, str]):  # type: ignore[override]
+            captured.append(cmd)
+            return _Res()
+
+        with patch("zotero_mcp.__init__.subprocess.run", side_effect=_fake_run):
+            out = build_exports_content("# T\n\nB", ["pdf"], useCiteproc=False, pdfEngine="weasyprint")
+            assert "Build exports" in out
+        assert captured, "expected pandoc invocation"
+        assert any("--pdf-engine=weasyprint" in " ".join(cmd) for cmd in captured if "/usr/bin/pandoc" in cmd[0])
+
+
 def test_validate_references_content_require_doi_url() -> None:
     doc = "Cite @k1."
     bib = '[{"id":"k1","title":"T"}]'
