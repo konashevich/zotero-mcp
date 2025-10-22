@@ -87,9 +87,20 @@ If pandoc isn’t found on the server, `zotero_build_exports_content` returns a 
 
 Export tools return download tokens instead of file content to avoid bloating the AI agent's context window.
 
+#### Choosing the Right Tool
+
+**For small documents (<20KB):** Use `zotero_build_exports_content`
+- Pass document/bibliography/CSL as string parameters
+- Simple and direct, but content goes through AI context window
+
+**For large documents (>20KB):** Use `zotero_build_exports_files` 
+- Pass server-native file paths instead of content strings
+- **Completely bypasses AI context window** - no token usage for document content
+- Requires files to be accessible on the server (e.g., via Docker volume mount)
+
 #### For AI Agents
 
-After calling `zotero_build_exports_content`, you'll receive:
+After calling `zotero_build_exports_content` or `zotero_build_exports_files`, you'll receive:
 
 - `token`: unique download identifier  
 - `downloadUrl`: direct HTTP endpoint
@@ -155,6 +166,53 @@ for artifact in result["artifacts"]:
     # Download file directly (bypasses AI context)
     subprocess.run(["curl", "-o", filename, url])
 ```
+
+#### Large Document Workflow (File-Based)
+
+For documents >20KB, use the three-step workflow to completely bypass context window:
+
+**Step 1: Upload files to server** (one-time per file):
+```python
+# Upload your markdown document
+mcp.call_tool("zotero_upload_file", {
+    "content": large_markdown_content,  # Your 50KB+ markdown
+    "filename": "paper.md"
+})
+# Returns: "Server path: /tmp/zotero-uploads/paper.md"
+
+# Upload bibliography
+mcp.call_tool("zotero_upload_file", {
+    "content": json.dumps(bibliography_array),
+    "filename": "refs.json"
+})
+# Returns: "Server path: /tmp/zotero-uploads/refs.json"
+
+# Upload CSL style
+mcp.call_tool("zotero_upload_file", {
+    "content": csl_xml_content,
+    "filename": "style.csl"
+})
+# Returns: "Server path: /tmp/zotero-uploads/style.csl"
+```
+
+**Step 2: Generate PDF using server paths**:
+```python
+result = mcp.call_tool("zotero_build_exports_files", {
+    "documentPath": "/tmp/zotero-uploads/paper.md",
+    "bibliographyPath": "/tmp/zotero-uploads/refs.json",
+    "cslPath": "/tmp/zotero-uploads/style.csl",
+    "formats": ["pdf"]
+})
+# Returns token/URL - NO content in response!
+```
+
+**Step 3: Download the generated PDF** using the returned URL.
+
+**Benefits:**
+- ✅ **Context window usage**: Only upload once (amortized cost)
+- ✅ **Handles unlimited document sizes** (tested with 50KB+ files)
+- ✅ **No MCP payload limits** - files stay on server
+- ✅ **Works across network** - Windows client → Linux server
 
 #### Export troubleshooting
 

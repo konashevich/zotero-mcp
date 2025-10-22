@@ -2623,6 +2623,133 @@ def build_exports_content(
 
 
 @mcp.tool(
+    name="zotero_build_exports_files",
+    description=(
+        "Build DOCX/PDF from files on the server filesystem (bypasses context window for large documents). "
+        "Provide server-native file paths. Files must be in accessible locations (e.g., /workspace mount). "
+        "Returns download tokens and URLs like build_exports_content."
+    ),
+)
+def build_exports_files(
+    documentPath: str,
+    formats: list[Literal["docx", "pdf"]],
+    outputBasename: str | None = None,
+    bibliographyPath: str | None = None,
+    cslPath: str | None = None,
+    useCiteproc: bool | None = True,
+    pdfEngine: Literal["wkhtmltopdf", "weasyprint", "xelatex"] | None = None,
+    extraArgs: list[str] | None = None,
+) -> str:
+    """
+    File-based version of build_exports_content for large documents.
+    Reads files directly from server filesystem to avoid context window bloat.
+    """
+    from pathlib import Path
+    
+    # Read document content
+    doc_path = Path(documentPath)
+    if not doc_path.exists():
+        return f"Error: Document file not found: {documentPath}"
+    if not doc_path.is_file():
+        return f"Error: Document path is not a file: {documentPath}"
+    
+    try:
+        documentContent = doc_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return f"Error reading document file {documentPath}: {exc}"
+    
+    # Read bibliography if provided
+    bibliographyContent = None
+    if bibliographyPath:
+        bib_path = Path(bibliographyPath)
+        if not bib_path.exists():
+            return f"Error: Bibliography file not found: {bibliographyPath}"
+        try:
+            import json
+            bib_text = bib_path.read_text(encoding="utf-8")
+            # Try to parse as JSON to validate
+            bibliographyContent = json.loads(bib_text)
+        except json.JSONDecodeError as exc:
+            return f"Error: Bibliography file is not valid JSON: {exc}"
+        except Exception as exc:
+            return f"Error reading bibliography file {bibliographyPath}: {exc}"
+    
+    # Read CSL style if provided
+    cslContent = None
+    if cslPath:
+        csl_path = Path(cslPath)
+        if not csl_path.exists():
+            return f"Error: CSL file not found: {cslPath}"
+        try:
+            cslContent = csl_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return f"Error reading CSL file {cslPath}: {exc}"
+    
+    logger.info(f"build_exports_files: reading from {documentPath} ({len(documentContent)} chars)")
+    if bibliographyPath:
+        logger.info(f"build_exports_files: bibliography from {bibliographyPath}")
+    if cslPath:
+        logger.info(f"build_exports_files: CSL from {cslPath}")
+    
+    # Delegate to the content-based implementation
+    return build_exports_content(
+        documentContent=documentContent,
+        formats=formats,
+        outputBasename=outputBasename,
+        bibliographyContent=bibliographyContent,
+        cslContent=cslContent,
+        useCiteproc=useCiteproc,
+        pdfEngine=pdfEngine,
+        extraArgs=extraArgs,
+    )
+
+
+@mcp.tool(
+    name="zotero_upload_file",
+    description=(
+        "Upload file content to the server's workspace for use with build_exports_files. "
+        "This bypasses context window for large files by: 1) uploading content once, "
+        "2) using the server path in build_exports_files. Returns the server path to use."
+    ),
+)
+def upload_file(
+    content: str,
+    filename: str,
+    encoding: Literal["utf-8", "utf-8-sig"] | None = "utf-8",
+) -> str:
+    """
+    Upload file content to the server workspace.
+    Designed for AI agents on remote machines to transfer large files efficiently.
+    """
+    from pathlib import Path
+    import os
+    
+    # Determine workspace directory (default to /tmp if not mounted)
+    workspace_base = Path(os.getenv("ZOTERO_DOCS_BASE", "/tmp/zotero-uploads"))
+    workspace_base.mkdir(parents=True, exist_ok=True)
+    
+    # Sanitize filename to prevent path traversal
+    safe_filename = Path(filename).name  # Only take the filename, no path components
+    if not safe_filename or safe_filename.startswith('.'):
+        return f"Error: Invalid filename '{filename}'"
+    
+    target_path = workspace_base / safe_filename
+    
+    try:
+        # Write content to file
+        target_path.write_text(content, encoding=encoding or "utf-8")
+        file_size = target_path.stat().st_size
+        
+        logger.info(f"Uploaded file {safe_filename} ({file_size} bytes) to {target_path}")
+        
+        return f"File uploaded successfully.\nServer path: {target_path}\nSize: {file_size} bytes\nUse this path in build_exports_files."
+    
+    except Exception as exc:
+        logger.error(f"Failed to upload file {filename}: {exc}", exc_info=True)
+        return f"Error uploading file: {exc}"
+
+
+@mcp.tool(
     name="zotero_insert_citation_content",
     description=(
         "Format citations for pandoc or LaTeX given citekeys and optional prefix/suffix/pages (content API)."

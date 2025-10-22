@@ -1,5 +1,7 @@
 # Copilot instructions for zotero-mcp
 
+This ZOTERO MCP server is designed to run on linux-based machine. The user (AI agent) of this sever is based in the homen network, using Windows OS. Therefore, all file uploads and downloads must be handled via server-side paths and HTTP endpoints, avoiding any cross-OS path mapping. More over, as any AI, it has limited context windows, so neither sending files nor receiving files should go directly via AI agent context window, but bypass it. 
+
 These notes align AI coding agents quickly to this repo’s patterns, workflows, and pitfalls. STRICT RULE: No backward compatibility. Remove legacy code and fallbacks when updating tools or behaviors.
 
 ## Big picture
