@@ -208,6 +208,84 @@ from mcp.server.fastmcp import FastMCP
 
 from zotero_mcp.client import get_attachment_details, get_zotero_client
 
+# File registry for download tokens
+@dataclass
+class FileInfo:
+    """Information about a file available for download."""
+    path: Path
+    filename: str
+    size: int
+    format: str
+    created_at: float
+    downloaded: bool = False
+
+
+FILE_REGISTRY: dict[str, FileInfo] = {}
+FILE_TTL_SECONDS = int(os.getenv("MCP_FILE_TTL", "3600"))  # 1 hour default
+MCP_FILES_DIR = Path(os.getenv("MCP_FILES_DIR", "/tmp/mcp-files"))
+MCP_DELETE_AFTER_DOWNLOAD = os.getenv("MCP_DELETE_AFTER_DOWNLOAD", "false").lower() == "true"
+
+
+def register_file(file_path: Path, filename: str, size: int, format: str) -> str:
+    """Register a file for download and return a secure token."""
+    import secrets
+    
+    # Ensure the base directory exists
+    MCP_FILES_DIR.mkdir(parents=True, exist_ok=True)
+    
+    token = secrets.token_urlsafe(32)
+    FILE_REGISTRY[token] = FileInfo(
+        path=file_path,
+        filename=filename,
+        size=size,
+        format=format,
+        created_at=time.time(),
+    )
+    logger.debug(f"Registered file {filename} with token {token[:8]}...")
+    return token
+
+
+def get_file(token: str) -> FileInfo | None:
+    """Retrieve file info by token if not expired."""
+    info = FILE_REGISTRY.get(token)
+    if not info:
+        return None
+    if time.time() - info.created_at > FILE_TTL_SECONDS:
+        cleanup_file(token)
+        return None
+    return info
+
+
+def cleanup_file(token: str) -> None:
+    """Remove file from registry and filesystem."""
+    if token in FILE_REGISTRY:
+        info = FILE_REGISTRY.pop(token)
+        try:
+            info.path.unlink(missing_ok=True)
+            # Try to remove parent directory if empty
+            try:
+                info.path.parent.rmdir()
+            except OSError:
+                pass  # Directory not empty or doesn't exist
+            logger.debug(f"Cleaned up file {info.filename} (token {token[:8]}...)")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup file {info.filename}: {e}")
+
+
+def cleanup_expired_files() -> int:
+    """Remove all files past TTL. Returns count of cleaned files."""
+    now = time.time()
+    expired = [
+        token for token, info in FILE_REGISTRY.items()
+        if now - info.created_at > FILE_TTL_SECONDS
+    ]
+    for token in expired:
+        cleanup_file(token)
+    if expired:
+        logger.info(f"Cleaned up {len(expired)} expired file(s)")
+    return len(expired)
+
+
 # Create an MCP server
 mcp = FastMCP("Zotero")
 @mcp.tool(
@@ -844,7 +922,8 @@ def _detect_pdf_engine(
 class _ExportArtifact:
     format: Literal["docx", "pdf"]
     filename: str
-    content: str
+    token: str
+    downloadUrl: str
     size: int
 
     def __post_init__(self) -> None:
@@ -852,8 +931,10 @@ class _ExportArtifact:
             raise ValueError(f"Unsupported artifact format: {self.format}")
         if not isinstance(self.filename, str) or not self.filename.strip():
             raise ValueError("filename must be a non-empty string")
-        if not isinstance(self.content, str) or not self.content:
-            raise ValueError("content must be a non-empty base64 string")
+        if not isinstance(self.token, str) or not self.token:
+            raise ValueError("token must be a non-empty string")
+        if not isinstance(self.downloadUrl, str) or not self.downloadUrl:
+            raise ValueError("downloadUrl must be a non-empty string")
         if not isinstance(self.size, int) or self.size < 0:
             raise ValueError("size must be a non-negative integer")
 
@@ -861,7 +942,8 @@ class _ExportArtifact:
         return {
             "format": self.format,
             "filename": self.filename,
-            "content": self.content,
+            "token": self.token,
+            "downloadUrl": self.downloadUrl,
             "size": self.size,
         }
 
@@ -2338,7 +2420,7 @@ def validate_references_content(
 @mcp.tool(
     name="zotero_build_exports_content",
     description=(
-        "Build DOCX/PDF from Markdown content using Pandoc with --citeproc. Returns base64-encoded artifacts so clients can write locally."
+        "Build DOCX/PDF from Markdown content using Pandoc with --citeproc. Returns download tokens and URLs for direct file retrieval (bypasses context window)."
     ),
 )
 def build_exports_content(
@@ -2352,7 +2434,6 @@ def build_exports_content(
     extraArgs: list[str] | None = None,
 ) -> str:
     import tempfile as _tempfile
-    import base64 as _base64
 
     if not formats:
         return "Error: No formats specified. Provide at least one of: docx, pdf."
@@ -2460,25 +2541,54 @@ def build_exports_content(
             if r.returncode != 0:
                 warnings.append(r.stderr.strip())
                 continue
-            try:
-                data = out_file.read_bytes()
-            except FileNotFoundError:
+            
+            # Check file exists and get size
+            if not out_file.exists():
                 warnings.append(f"artifact {fmt} missing at {out_file}")
                 continue
-            except Exception as exc:  # noqa: BLE001
-                warnings.append(f"artifact {fmt} read failed: {exc}")
-                continue
-            b64 = _base64.b64encode(data).decode("ascii")
+            
             try:
+                file_size = out_file.stat().st_size
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"artifact {fmt} stat failed: {exc}")
+                continue
+            
+            # Move file to persistent location for download
+            try:
+                import secrets
+                # Generate token for this file
+                file_token = secrets.token_urlsafe(32)
+                token_dir = MCP_FILES_DIR / file_token
+                token_dir.mkdir(parents=True, exist_ok=True)
+                final_filename = f"{basename}.{fmt}"
+                final_path = token_dir / final_filename
+                shutil.move(str(out_file), str(final_path))
+                
+                # Register file in registry
+                FILE_REGISTRY[file_token] = FileInfo(
+                    path=final_path,
+                    filename=final_filename,
+                    size=file_size,
+                    format=fmt,
+                    created_at=time.time(),
+                )
+                logger.debug(f"Registered file {final_filename} with token {file_token[:8]}...")
+                
+                # Build download URL
+                host = os.getenv("MCP_HOST", "localhost")
+                port = os.getenv("MCP_PORT", "9180")
+                download_url = f"http://{host}:{port}/files/{file_token}"
+                
                 artifact = _ExportArtifact(
                     format=fmt,
-                    filename=f"{basename}.{fmt}",
-                    content=b64,
-                    size=len(data),
+                    filename=final_filename,
+                    token=file_token,
+                    downloadUrl=download_url,
+                    size=file_size,
                 )
                 out_artifacts.append(artifact.as_dict())
-            except ValueError as exc:
-                warnings.append(f"artifact {fmt} validation failed: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(f"artifact {fmt} registration failed: {exc}")
     finally:
         shutil.rmtree(tempdir, ignore_errors=True)
     _ms = round((time.perf_counter() - _t0) * 1000, 1)
@@ -2487,6 +2597,10 @@ def build_exports_content(
         "# Build exports",
         f"Formats: {', '.join(formats)}",
         f"Basename: {basename}",
+        "",
+        "Download files using the provided URLs or tokens.",
+        "Example: `curl -o output.pdf <downloadUrl>`",
+        f"Files expire after {FILE_TTL_SECONDS // 60} minutes.",
     ]
     chosen_engine_version = None
     try:

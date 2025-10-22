@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import base64
 import re
 from pathlib import Path
 import pytest
@@ -56,7 +55,7 @@ def test_build_exports_invokes_pandoc(tmp_path: Path) -> None:
             assert "Build exports" in out
 
 
-def test_build_exports_returns_base64_payload() -> None:
+def test_build_exports_returns_token_payload() -> None:
     def _fake_run(cmd: list[str], capture_output: bool, text: bool, env: dict[str, str]):  # type: ignore[override]
         out_index = cmd.index("-o")
         out_path = Path(cmd[out_index + 1])
@@ -82,10 +81,11 @@ def test_build_exports_returns_base64_payload() -> None:
 
     artifacts = _extract_artifacts(out)
     assert artifacts and artifacts[0]["format"] == "docx"
-    blob = artifacts[0]["content"]
-    decoded = base64.b64decode(blob)
-    assert decoded == b"fake-bytes"
-    assert artifacts[0]["size"] == len(decoded)
+    # Should return token and downloadUrl instead of content
+    assert "token" in artifacts[0]
+    assert "downloadUrl" in artifacts[0]
+    assert "content" not in artifacts[0]  # No base64 content
+    assert artifacts[0]["size"] == 10  # len(b"fake-bytes")
 
 
 def test_build_exports_uses_title_for_filename() -> None:

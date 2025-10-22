@@ -34,6 +34,9 @@ except Exception:
 		print('Warning: no YAML lib found in build env:', e, file=sys.stderr)
 PY
 
+# Create directory for file downloads with proper permissions
+RUN mkdir -p /tmp/mcp-files && chmod 1777 /tmp/mcp-files
+
 LABEL org.opencontainers.image.title="zotero-mcp"
 LABEL org.opencontainers.image.description="Model Context Protocol Server for Zotero"
 LABEL org.opencontainers.image.url="https://github.com/zotero/zotero-mcp"

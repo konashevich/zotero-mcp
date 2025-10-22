@@ -5,10 +5,11 @@ These notes align AI coding agents quickly to this repo’s patterns, workflows,
 ## Big picture
 - This is a Python Model Context Protocol (MCP) server exposing Zotero tools over SSE.
 - Entry points:
-  - `src/zotero_mcp/__init__.py`: all MCP tools (read, write, exports, validation). Also logging, caching, path handling.
-  - `src/zotero_mcp/cli.py`: wires FastMCP server (SSE) for `zotero-mcp` command.
+  - `src/zotero_mcp/__init__.py`: all MCP tools (read, write, exports, validation). Also logging, caching, path handling, and file registry for downloads.
+  - `src/zotero_mcp/cli.py`: wires FastMCP server (SSE) for `zotero-mcp` command. Adds HTTP file download endpoint at GET /files/{token}.
 - Key integrations: PyZotero client (via `zotero_mcp.client`), PyYAML/ruamel for YAML, Pandoc for exports, Better BibTeX auto‑export (local API at 127.0.0.1:23119).
 - Docker image provides a runnable SSE server; Make targets automate build/redeploy.
+- File downloads: Generated files (PDF/DOCX) are served via HTTP to bypass AI context window. Files stored temporarily with token-based access and TTL cleanup.
 
 ## Critical workflows
 - Run locally (no Docker): `uv run zotero-mcp` (set ZOTERO_API_KEY and ZOTERO_LIBRARY_ID in env or .env.local).
@@ -47,6 +48,7 @@ These notes align AI coding agents quickly to this repo’s patterns, workflows,
 - For YAML/text I/O: normalize line endings to `\n`; encoding `utf-8-sig`.
 - Return concise, markdown‑friendly strings; include compact JSON sections when useful.
 - Use small, local helpers in `__init__.py` for consistency (caching, rate limiting, error formatting). Remove legacy branches when updating.
+- Export tools (build_exports_content) return download tokens, not file content. AI agents download files via HTTP GET to /files/{token}. Files stored in /tmp/mcp-files/{token}/ with automatic cleanup. NO base64 content in tool responses (removed for efficiency).
 
 ## Gotchas
 - No backward compatibility: delete old params/aliases when changing public tool shapes.

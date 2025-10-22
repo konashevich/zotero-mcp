@@ -48,7 +48,7 @@ This MCP server provides the following tools. Strict policy: no backward compati
 ### Validation & Build Tools
 
 - `zotero_validate_references_content`: Validate Markdown citekeys against a CSL JSON bibliography string; returns unresolved, duplicates, missing fields, suggestions
-- `zotero_build_exports_content`: Build DOCX/PDF from Markdown content using Pandoc. Each artifact is returned inline with `{format, filename, content(base64), size}` so clients can write files locally without touching the server filesystem.
+- `zotero_build_exports_content`: Build DOCX/PDF from Markdown content using Pandoc. Returns download tokens and URLs for direct file retrieval, bypassing the AI agent's context window entirely.
 
 #### Environment knobs (build/export)
 
@@ -83,12 +83,51 @@ If pandoc isn’t found on the server, `zotero_build_exports_content` returns a 
 - It decodes the base64 `content` payload the tool returns and writes files using the provided `filename`.
 - Flags: `--out-dir` (defaults to `.`) and `--output-basename` (force a specific filename stem); `--pdf-engine` selects among `wkhtmltopdf`, `weasyprint`, or `xelatex`.
 
-#### Example client decoding snippet
+### File Downloads (PDF/DOCX Exports)
+
+Export tools return download tokens instead of file content to avoid bloating the AI agent's context window.
+
+#### For AI Agents
+
+After calling `zotero_build_exports_content`, you'll receive:
+
+- `token`: unique download identifier  
+- `downloadUrl`: direct HTTP endpoint
+- `filename`: suggested filename
+- `size`: file size in bytes
+
+Download the file directly using curl or wget:
+
+```bash
+curl -o output.pdf http://localhost:9180/files/{token}
+```
+
+Files expire after 1 hour by default (configurable via `MCP_FILE_TTL` environment variable).
+
+#### For Human Users
+
+If running the MCP server outside Docker, files are accessible at:
+
+```text
+http://localhost:9180/files/{token}
+```
+
+Simply open the URL in a browser or use any HTTP client to download.
+
+#### Configuration
+
+Environment variables for file downloads:
+
+- `MCP_FILE_TTL`: File expiration in seconds (default: 3600 = 1 hour)
+- `MCP_HOST`: Host for download URLs (default: localhost)
+- `MCP_PORT`: Port for download URLs (default: 9180, matches Docker port mapping)
+- `MCP_FILES_DIR`: Directory for temporary files (default: /tmp/mcp-files)
+- `MCP_DELETE_AFTER_DOWNLOAD`: Delete files after first download (default: false). Set to "true" for one-time downloads.
+
+#### Example workflow
 
 ```python
-import base64
-from pathlib import Path
-
+# Call the MCP tool
 result = mcp.call_tool(
     "zotero_build_exports_content",
     {
@@ -97,9 +136,14 @@ result = mcp.call_tool(
     },
 )
 
+# Extract download info (no file content in context!)
 for artifact in result["artifacts"]:
-    data = base64.b64decode(artifact["content"])
-    Path(artifact["filename"]).write_bytes(data)
+    token = artifact["token"]
+    url = artifact["downloadUrl"]
+    filename = artifact["filename"]
+    
+    # Download file directly (bypasses AI context)
+    subprocess.run(["curl", "-o", filename, url])
 ```
 
 #### Export troubleshooting
