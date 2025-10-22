@@ -2572,7 +2572,7 @@ def build_exports_content(
                     format=fmt,
                     created_at=time.time(),
                 )
-                logger.debug(f"Registered file {final_filename} with token {file_token[:8]}...")
+                logger.info(f"Registered file {final_filename} with token {file_token[:8]}... (registry size: {len(FILE_REGISTRY)})")
                 
                 # Build download URL
                 host = os.getenv("MCP_HOST", "localhost")
@@ -2588,6 +2588,7 @@ def build_exports_content(
                 )
                 out_artifacts.append(artifact.as_dict())
             except Exception as exc:  # noqa: BLE001
+                logger.error(f"artifact {fmt} registration failed: {exc}", exc_info=True)
                 warnings.append(f"artifact {fmt} registration failed: {exc}")
     finally:
         shutil.rmtree(tempdir, ignore_errors=True)

@@ -26,6 +26,9 @@ set +o allexport
 : "${ZOTERO_LIBRARY_ID:?ZOTERO_LIBRARY_ID must be set in .env.local}"
 ZOTERO_LIBRARY_TYPE=${ZOTERO_LIBRARY_TYPE:-user}
 MCP_PORT=${MCP_PORT:-9180}
+MCP_HOST=${MCP_HOST:-localhost}
+MCP_FILE_TTL=${MCP_FILE_TTL:-3600}
+MCP_DELETE_AFTER_DOWNLOAD=${MCP_DELETE_AFTER_DOWNLOAD:-false}
 
 # Optional bind mount of a host docs directory, e.g., your manuscripts folder
 HOST_DOCS_DIR=${HOST_DOCS_DIR:-}
@@ -56,6 +59,10 @@ DOCKER_ARGS=(
   -e ZOTERO_API_KEY="$ZOTERO_API_KEY" \
   -e ZOTERO_LIBRARY_ID="$ZOTERO_LIBRARY_ID" \
   -e ZOTERO_LIBRARY_TYPE="$ZOTERO_LIBRARY_TYPE" \
+  -e MCP_HOST="$MCP_HOST" \
+  -e MCP_PORT="$MCP_PORT" \
+  -e MCP_FILE_TTL="$MCP_FILE_TTL" \
+  -e MCP_DELETE_AFTER_DOWNLOAD="$MCP_DELETE_AFTER_DOWNLOAD" \
 )
 
 # If mapping Windows paths, pass host drives root to container

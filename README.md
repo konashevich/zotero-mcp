@@ -119,10 +119,20 @@ Simply open the URL in a browser or use any HTTP client to download.
 Environment variables for file downloads:
 
 - `MCP_FILE_TTL`: File expiration in seconds (default: 3600 = 1 hour)
-- `MCP_HOST`: Host for download URLs (default: localhost)
+- `MCP_HOST`: Host for download URLs (default: localhost). **For remote access**, set this to your server's IP address (e.g., `192.168.1.114`) or hostname
 - `MCP_PORT`: Port for download URLs (default: 9180, matches Docker port mapping)
 - `MCP_FILES_DIR`: Directory for temporary files (default: /tmp/mcp-files)
 - `MCP_DELETE_AFTER_DOWNLOAD`: Delete files after first download (default: false). Set to "true" for one-time downloads.
+
+**Important for networked deployments:** If your MCP server is running on a different machine than the AI agent (e.g., Docker on a home server accessed from another computer), you **must** set `MCP_HOST` to the server's network-accessible IP address. Otherwise, download URLs will contain `localhost` and won't work from remote clients.
+
+Example `.env.local` for remote access:
+```bash
+ZOTERO_API_KEY=your_key
+ZOTERO_LIBRARY_ID=your_id
+MCP_HOST=192.168.1.114  # Your server's IP
+MCP_PORT=9180
+```
 
 #### Example workflow
 

@@ -9,12 +9,16 @@ from zotero_mcp import mcp, zotero_health, logger, get_file, cleanup_expired_fil
 async def download_file_handler(request):
     """Handle GET /files/{token} requests for file downloads."""
     from starlette.responses import StreamingResponse, Response
-    from zotero_mcp import cleanup_file, MCP_DELETE_AFTER_DOWNLOAD
+    from zotero_mcp import cleanup_file, MCP_DELETE_AFTER_DOWNLOAD, FILE_REGISTRY
     
     token = request.path_params.get('token', '')
     
+    logger.info(f"Download request for token: {token[:8]}... (registry has {len(FILE_REGISTRY)} entries)")
+    
     file_info = get_file(token)
     if not file_info:
+        logger.warning(f"Token not found in registry: {token[:8]}...")
+        logger.debug(f"Available tokens: {[k[:8] for k in FILE_REGISTRY.keys()]}")
         return Response("File not found or expired", status_code=404)
     
     if not file_info.path.exists():
@@ -84,71 +88,60 @@ def setup_file_routes_and_lifespan():
     from contextlib import asynccontextmanager
     
     try:
-        # FastMCP exposes the underlying Starlette app via sse_app() method
-        app = None
-        if hasattr(mcp, 'sse_app') and callable(mcp.sse_app):
-            app = mcp.sse_app()
-        elif hasattr(mcp, 'sse_app'):
-            app = mcp.sse_app
-        elif hasattr(mcp, 'app'):
-            app = mcp.app
-        elif hasattr(mcp, '_app'):
-            app = mcp._app
-        elif hasattr(mcp, '_server') and hasattr(mcp._server, 'app'):
-            app = mcp._server.app
+        # We need to patch sse_app() to return a modified instance
+        # because FastMCP creates a new app each time sse_app() is called
+        original_sse_app = mcp.sse_app
+        modified_app = None
         
-        if app is None:
-            logger.critical("Could not access FastMCP's Starlette app for file routes")
-            return False
-        
-        # Add the file download route
-        from starlette.routing import Route
-        
-        # Check if routes can be added dynamically
-        if hasattr(app, 'add_route'):
+        def patched_sse_app():
+            nonlocal modified_app
+            if modified_app is not None:
+                return modified_app
+            
+            # Create the app using the original method
+            app = original_sse_app()
+            
+            # Add the file download route
+            from starlette.routing import Route
             app.add_route("/files/{token}", download_file_handler, methods=["GET"])
             logger.info("Added file download route: GET /files/{token}")
-        elif hasattr(app, 'routes'):
-            # Manually append to routes list
-            file_route = Route("/files/{token}", download_file_handler, methods=["GET"])
-            app.routes.append(file_route)
-            logger.info("Added file download route: GET /files/{token}")
-        else:
-            logger.warning("Could not add file download route to app")
-            return False
-        
-        # Setup lifespan context manager for cleanup task
-        original_lifespan = getattr(app.router, 'lifespan_context', None)
-        
-        @asynccontextmanager
-        async def lifespan_with_cleanup(app_instance):
-            """Lifespan that manages background cleanup task."""
-            # Start cleanup task
-            cleanup_task = asyncio.create_task(periodic_cleanup_task())
-            logger.info("Started file cleanup background task")
             
-            try:
-                # If there was an original lifespan, run it
-                if original_lifespan:
-                    async with original_lifespan(app_instance):
-                        yield
-                else:
-                    yield
-            finally:
-                # Cancel cleanup on shutdown
-                cleanup_task.cancel()
+            # Setup lifespan context manager for cleanup task
+            original_lifespan = getattr(app.router, 'lifespan_context', None)
+            
+            @asynccontextmanager
+            async def lifespan_with_cleanup(app_instance):
+                """Lifespan that manages background cleanup task."""
+                # Start cleanup task
+                cleanup_task = asyncio.create_task(periodic_cleanup_task())
+                logger.info("Started file cleanup background task")
+                
                 try:
-                    await cleanup_task
-                except asyncio.CancelledError:
-                    pass
-                logger.info("Stopped file cleanup background task")
+                    # If there was an original lifespan, run it
+                    if original_lifespan:
+                        async with original_lifespan(app_instance):
+                            yield
+                    else:
+                        yield
+                finally:
+                    # Cancel cleanup on shutdown
+                    cleanup_task.cancel()
+                    try:
+                        await cleanup_task
+                    except asyncio.CancelledError:
+                        pass
+                    logger.info("Stopped file cleanup background task")
+            
+            # Replace lifespan
+            if hasattr(app, 'router'):
+                app.router.lifespan_context = lifespan_with_cleanup
+                logger.info("Configured lifespan for background cleanup")
+            
+            modified_app = app
+            return app
         
-        # Replace lifespan
-        if hasattr(app, 'router'):
-            app.router.lifespan_context = lifespan_with_cleanup
-            logger.info("Configured lifespan for background cleanup")
-        else:
-            logger.warning("Could not setup lifespan - background cleanup may not work")
+        # Replace the sse_app method
+        mcp.sse_app = patched_sse_app
         
         return True
         
