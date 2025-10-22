@@ -2708,21 +2708,35 @@ def build_exports_files(
     name="zotero_upload_file",
     description=(
         "Upload file content to the server's workspace for use with build_exports_files. "
+        "Accepts string content OR JSON structures (auto-serialized). "
         "This bypasses context window for large files by: 1) uploading content once, "
         "2) using the server path in build_exports_files. Returns the server path to use."
     ),
 )
 def upload_file(
-    content: str,
+    content: Any,  # Accept any type - string or parsed JSON
     filename: str,
     encoding: Literal["utf-8", "utf-8-sig"] | None = "utf-8",
 ) -> str:
     """
     Upload file content to the server workspace.
     Designed for AI agents on remote machines to transfer large files efficiently.
+    Accepts both raw strings and parsed JSON structures (which are auto-serialized).
     """
     from pathlib import Path
     import os
+    import json
+    
+    # Convert content to string if it's not already
+    if isinstance(content, str):
+        content_str = content
+    else:
+        # If it's a list/dict (parsed JSON), serialize it back to string
+        try:
+            content_str = json.dumps(content, ensure_ascii=False, indent=2)
+            logger.info(f"Auto-serialized {type(content).__name__} to JSON string for {filename}")
+        except Exception as exc:
+            return f"Error: Cannot serialize content of type {type(content).__name__}: {exc}"
     
     # Determine workspace directory (default to /tmp if not mounted)
     workspace_base = Path(os.getenv("ZOTERO_DOCS_BASE", "/tmp/zotero-uploads"))
@@ -2737,7 +2751,7 @@ def upload_file(
     
     try:
         # Write content to file
-        target_path.write_text(content, encoding=encoding or "utf-8")
+        target_path.write_text(content_str, encoding=encoding or "utf-8")
         file_size = target_path.stat().st_size
         
         logger.info(f"Uploaded file {safe_filename} ({file_size} bytes) to {target_path}")
